@@ -42,7 +42,7 @@ Must handle both IPv4 and IPv6, normalizing IPv6 to consistent format."
 <p align="center">
   <img src="./docs/assets/zeroshot-demo.gif" alt="Demo" width="700">
   <br>
-  <em>Sped up 10x — original recording: 44 minutes</em>
+  <em>Sped up 10x — original recording: 77 minutes</em>
 </p>
 
 ---
