@@ -572,7 +572,7 @@ function followClaudeTaskLogs(agent, taskId) {
         content = timestampMatch[2];
       }
 
-      // Skip known non-JSON patterns (footer, separators, metadata)
+      // Skip known noise patterns (footer, separators, metadata)
       if (
         content.startsWith('===') ||
         content.startsWith('Finished:') ||
@@ -582,19 +582,20 @@ function followClaudeTaskLogs(agent, taskId) {
         return;
       }
 
-      // Only parse lines that start with { (likely JSON)
-      if (!content.trim().startsWith('{')) {
-        return;
+      // Determine if this is JSON or plain text output
+      const isJson = content.trim().startsWith('{');
+      let isValidJson = false;
+
+      if (isJson) {
+        try {
+          JSON.parse(content);
+          isValidJson = true;
+        } catch {
+          // Looks like JSON but isn't valid - treat as text
+        }
       }
 
-      // Validate it's valid JSON before broadcasting
-      try {
-        JSON.parse(content);
-      } catch {
-        // Not valid JSON, skip silently
-        return;
-      }
-
+      // Accumulate output (JSON for parsing, text for human visibility)
       output += content + '\n';
 
       // Update liveness timestamp
@@ -607,7 +608,7 @@ function followClaudeTaskLogs(agent, taskId) {
         content: {
           text: content,
           data: {
-            type: 'stdout',
+            type: isValidJson ? 'json' : 'text',
             line: content,
             agent: agent.id,
             role: agent.role,
