@@ -1,3 +1,45 @@
+# [4.0.0](https://github.com/covibes/zeroshot/compare/v3.1.0...v4.0.0) (2026-01-04)
+
+
+### Bug Fixes
+
+* adversarial tester condition and README accuracy ([c12109b](https://github.com/covibes/zeroshot/commit/c12109b5ee574301e472bd09ec7495f3a578dc36))
+* **ci:** use correct agent state in status-footer test ([c6f54a8](https://github.com/covibes/zeroshot/commit/c6f54a89d91a621a8d92c1a21dfa796743e38cd2))
+* **cli:** ensure PROCESS_SPAWNED sets EXECUTING_TASK state ([4c3cc9c](https://github.com/covibes/zeroshot/commit/4c3cc9c82b67513cf6ab5e5eca9de1b6d259a9d1))
+* **ledger:** prevent write-after-close race condition ([6b64fcf](https://github.com/covibes/zeroshot/commit/6b64fcfa37a4396591599774c788a022cdbfb1e9))
+* **release:** allow semantic-release to query remote tags ([0be475b](https://github.com/covibes/zeroshot/commit/0be475b264d400c6b504306e7c535b2736dfaaa1))
+* **release:** explicitly fetch tags for semantic-release ([cecf735](https://github.com/covibes/zeroshot/commit/cecf7358d9091992d4c7a1191f874588ba7a592d))
+* **tests:** ensure first-run tests are isolated from module cache ([e55dbe7](https://github.com/covibes/zeroshot/commit/e55dbe7255bab7cf3ec4ddefcc897ec71296a74a))
+* **tests:** move env var and module setup to before() hook ([cf787ff](https://github.com/covibes/zeroshot/commit/cf787ff7453d1a65cbaaf98655606ccb38dea967))
+* **tests:** use validateConfig for modelRules catch-all validation ([4092d78](https://github.com/covibes/zeroshot/commit/4092d78be5739f6a3ca4bc80b3dc25ea7c41f74d))
+
+
+### chore
+
+* bump version to 4.0.0 ([95844e8](https://github.com/covibes/zeroshot/commit/95844e8ffeee4d24dde56b084053d0cdcd30d3e9))
+
+
+### Features
+
+* **context:** enforce maximum informativeness, minimum verbosity ([f99a7b7](https://github.com/covibes/zeroshot/commit/f99a7b738214863744119a9b96a50590034299aa))
+* **prompts:** add universal language/task support with LLM antipattern detection ([906102b](https://github.com/covibes/zeroshot/commit/906102b654914ccd73ebb8abaa121304ee4f347e))
+
+
+### Performance Improvements
+
+* **ci:** reduce matrix from 6 jobs to 1 (save ~90% minutes) ([cad652d](https://github.com/covibes/zeroshot/commit/cad652d22fdc24cf10efabf04e13902529c05b98))
+* **validators:** remove relevance/notes fields to save tokens ([b775e5a](https://github.com/covibes/zeroshot/commit/b775e5a028475f2f11d3b87ec0202c4398100c1d))
+
+
+### BREAKING CHANGES
+
+* CREW_* env vars renamed to ZEROSHOT_*
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+* **prompts:** Validator prompts no longer include language-specific examples
+
 # [3.1.0](https://github.com/covibes/zeroshot/compare/v3.0.0...v3.1.0) (2026-01-03)
 
 
