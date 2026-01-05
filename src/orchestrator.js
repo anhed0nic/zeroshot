@@ -765,6 +765,181 @@ class Orchestrator {
         cluster.agents.push(agent);
       }
 
+      // ========================================================================
+      // CRITICAL ORDERING INVARIANT (Issue #31 - Subscription Race Condition)
+      // ========================================================================
+      // MUST register ALL subscriptions BEFORE starting agents.
+      //
+      // WHY: EventEmitter is synchronous and doesn't replay past events to new
+      // listeners. If an agent completes and publishes CLUSTER_COMPLETE before
+      // we register the subscription, the orchestrator will never receive the
+      // message and the cluster will appear stuck in 'executing_task' forever.
+      //
+      // ORDER:
+      //   1. Register subscriptions (lines below)
+      //   2. Start agents (line ~XXX)
+      //   3. Publish ISSUE_OPENED (line ~XXX)
+      //
+      // DO NOT move subscriptions after agent.start() - this will reintroduce
+      // the race condition fixed in issue #31.
+      // ========================================================================
+
+      // Helper: Subscribe to cluster-scoped topic
+      const subscribeToClusterTopic = (topic, handler) => {
+        messageBus.subscribe((message) => {
+          if (message.topic === topic && message.cluster_id === clusterId) {
+            handler(message);
+          }
+        });
+      };
+
+      // Watch for CLUSTER_COMPLETE message to auto-stop
+      subscribeToClusterTopic('CLUSTER_COMPLETE', (message) => {
+        this._log(`\n${'='.repeat(80)}`);
+        this._log(`✅ CLUSTER COMPLETED SUCCESSFULLY: ${clusterId}`);
+        this._log(`${'='.repeat(80)}`);
+        this._log(`Reason: ${message.content?.data?.reason || 'unknown'}`);
+        this._log(`Initiated by: ${message.sender}`);
+        this._log(`${'='.repeat(80)}\n`);
+
+        // Auto-stop cluster
+        this.stop(clusterId).catch((err) => {
+          console.error(`Failed to auto-stop cluster ${clusterId}:`, err.message);
+        });
+      });
+
+      // Watch for CLUSTER_FAILED message to auto-stop
+      subscribeToClusterTopic('CLUSTER_FAILED', (message) => {
+        this._log(`\n${'='.repeat(80)}`);
+        this._log(`❌ CLUSTER FAILED: ${clusterId}`);
+        this._log(`${'='.repeat(80)}`);
+        this._log(`Reason: ${message.content?.data?.reason || 'unknown'}`);
+        this._log(`Agent: ${message.sender}`);
+        if (message.content?.text) {
+          this._log(`Details: ${message.content.text}`);
+        }
+        this._log(`${'='.repeat(80)}\n`);
+
+        // Auto-stop cluster
+        this.stop(clusterId).catch((err) => {
+          console.error(`Failed to auto-stop cluster ${clusterId}:`, err.message);
+        });
+      });
+
+      // Watch for AGENT_ERROR - if critical agent fails, stop cluster
+      subscribeToClusterTopic('AGENT_ERROR', (message) => {
+        const agentRole = message.content?.data?.role;
+        const attempts = message.content?.data?.attempts || 1;
+
+        // Save cluster state to persist failureInfo
+        this._saveClusters();
+
+        // Only stop cluster if non-validator agent exhausted retries
+        if (agentRole === 'implementation' && attempts >= 3) {
+          this._log(`\n${'='.repeat(80)}`);
+          this._log(`❌ WORKER AGENT FAILED: ${clusterId}`);
+          this._log(`${'='.repeat(80)}`);
+          this._log(`Worker agent ${message.sender} failed after ${attempts} attempts`);
+          this._log(`Error: ${message.content?.data?.error || 'unknown'}`);
+          this._log(`Stopping cluster - worker cannot continue`);
+          this._log(`${'='.repeat(80)}\n`);
+
+          // Auto-stop cluster
+          this.stop(clusterId).catch((err) => {
+            console.error(`Failed to auto-stop cluster ${clusterId}:`, err.message);
+          });
+        }
+      });
+
+      // Persist agent state changes for accurate status display
+      messageBus.on('topic:AGENT_LIFECYCLE', (message) => {
+        const event = message.content?.data?.event;
+        // Save on key state transitions that affect status display
+        if (
+          ['TASK_STARTED', 'TASK_COMPLETED', 'PROCESS_SPAWNED', 'TASK_ID_ASSIGNED', 'STARTED'].includes(
+            event
+          )
+        ) {
+          this._saveClusters();
+        }
+      });
+
+      // Watch for stale agent detection (informational only)
+      messageBus.on('topic:AGENT_LIFECYCLE', (message) => {
+        if (message.content?.data?.event !== 'AGENT_STALE_WARNING') return;
+
+        const agentId = message.content?.data?.agent;
+        const timeSinceLastOutput = message.content?.data?.timeSinceLastOutput;
+        const analysis = message.content?.data?.analysis || 'No analysis available';
+
+        this._log(
+          `⚠️  Orchestrator: Agent ${agentId} appears stale (${Math.round(timeSinceLastOutput / 1000)}s no output) but will NOT be killed`
+        );
+        this._log(`    Analysis: ${analysis}`);
+        this._log(`    Manual intervention may be needed - use 'zeroshot resume ${clusterId}' if stuck`);
+      });
+
+      // Watch for CLUSTER_OPERATIONS - dynamic agent spawn/removal/update
+      subscribeToClusterTopic('CLUSTER_OPERATIONS', (message) => {
+        let operations = message.content?.data?.operations;
+
+        // Parse operations if they came as a JSON string
+        if (typeof operations === 'string') {
+          try {
+            operations = JSON.parse(operations);
+          } catch (e) {
+            this._log(`⚠️ CLUSTER_OPERATIONS has invalid operations JSON: ${e.message}`);
+            return;
+          }
+        }
+
+        if (!operations || !Array.isArray(operations)) {
+          this._log(`⚠️ CLUSTER_OPERATIONS missing operations array, ignoring`);
+          return;
+        }
+
+        this._log(`\n${'='.repeat(80)}`);
+        this._log(`🔧 CLUSTER_OPERATIONS received from ${message.sender}`);
+        this._log(`${'='.repeat(80)}`);
+        if (message.content?.data?.reasoning) {
+          this._log(`Reasoning: ${message.content.data.reasoning}`);
+        }
+        this._log(`Operations: ${operations.length}`);
+        this._log(`${'='.repeat(80)}\n`);
+
+        // Execute operation chain
+        this._handleOperations(clusterId, operations, message.sender, {
+          isolationManager,
+          containerId,
+        }).catch((err) => {
+          console.error(`Failed to execute CLUSTER_OPERATIONS:`, err.message);
+          // Publish failure message
+          messageBus.publish({
+            cluster_id: clusterId,
+            topic: 'CLUSTER_OPERATIONS_FAILED',
+            sender: 'orchestrator',
+            content: {
+              text: `Operation chain failed: ${err.message}`,
+              data: {
+                error: err.message,
+                operations: operations,
+              },
+            },
+          });
+
+          // CRITICAL: Stop cluster on operation failure
+          this._log(`\n${'='.repeat(80)}`);
+          this._log(`❌ CLUSTER_OPERATIONS FAILED - STOPPING CLUSTER`);
+          this._log(`${'='.repeat(80)}`);
+          this._log(`Error: ${err.message}`);
+          this._log(`${'='.repeat(80)}\n`);
+
+          this.stop(clusterId).catch((stopErr) => {
+            console.error(`Failed to stop cluster after operation failure:`, stopErr.message);
+          });
+        });
+      });
+
       // Start all agents
       for (const agent of cluster.agents) {
         await agent.start();
@@ -797,164 +972,6 @@ class Orchestrator {
       }
 
       this._log(`Cluster ${clusterId} started with ${cluster.agents.length} agents`);
-
-      // Watch for CLUSTER_COMPLETE message to auto-stop
-      messageBus.subscribe((message) => {
-        if (message.topic === 'CLUSTER_COMPLETE' && message.cluster_id === clusterId) {
-          this._log(`\n${'='.repeat(80)}`);
-          this._log(`✅ CLUSTER COMPLETED SUCCESSFULLY: ${clusterId}`);
-          this._log(`${'='.repeat(80)}`);
-          this._log(`Reason: ${message.content?.data?.reason || 'unknown'}`);
-          this._log(`Initiated by: ${message.sender}`);
-          this._log(`${'='.repeat(80)}\n`);
-
-          // Auto-stop cluster
-          this.stop(clusterId).catch((err) => {
-            console.error(`Failed to auto-stop cluster ${clusterId}:`, err.message);
-          });
-        }
-      });
-
-      // Watch for CLUSTER_FAILED message to auto-stop (e.g., max iterations reached)
-      messageBus.subscribe((message) => {
-        if (message.topic === 'CLUSTER_FAILED' && message.cluster_id === clusterId) {
-          this._log(`\n${'='.repeat(80)}`);
-          this._log(`❌ CLUSTER FAILED: ${clusterId}`);
-          this._log(`${'='.repeat(80)}`);
-          this._log(`Reason: ${message.content?.data?.reason || 'unknown'}`);
-          this._log(`Agent: ${message.sender}`);
-          if (message.content?.text) {
-            this._log(`Details: ${message.content.text}`);
-          }
-          this._log(`${'='.repeat(80)}\n`);
-
-          // Auto-stop cluster
-          this.stop(clusterId).catch((err) => {
-            console.error(`Failed to auto-stop cluster ${clusterId}:`, err.message);
-          });
-        }
-      });
-
-      // Watch for AGENT_ERROR - if critical agent (worker/implementation) fails, stop cluster
-      // Validators auto-approve after retries (see agent-wrapper retry logic)
-      messageBus.subscribe((message) => {
-        if (message.topic === 'AGENT_ERROR' && message.cluster_id === clusterId) {
-          const agentRole = message.content?.data?.role;
-          const attempts = message.content?.data?.attempts || 1;
-
-          // Save cluster state to persist failureInfo (set by agent-wrapper on failure)
-          // This ensures resume capability even if cluster doesn't stop
-          this._saveClusters();
-
-          // Only stop cluster if non-validator agent exhausted retries
-          if (agentRole === 'implementation' && attempts >= 3) {
-            this._log(`\n${'='.repeat(80)}`);
-            this._log(`❌ WORKER AGENT FAILED: ${clusterId}`);
-            this._log(`${'='.repeat(80)}`);
-            this._log(`Worker agent ${message.sender} failed after ${attempts} attempts`);
-            this._log(`Error: ${message.content?.data?.error || 'unknown'}`);
-            this._log(`Stopping cluster - worker cannot continue`);
-            this._log(`${'='.repeat(80)}\n`);
-
-            // Auto-stop cluster
-            this.stop(clusterId).catch((err) => {
-              console.error(`Failed to auto-stop cluster ${clusterId}:`, err.message);
-            });
-          }
-        }
-      });
-
-      // Persist agent state changes for accurate status display from other processes
-      messageBus.on('topic:AGENT_LIFECYCLE', (message) => {
-        const event = message.content?.data?.event;
-        // Save on key state transitions that affect status display
-        if (['TASK_STARTED', 'TASK_COMPLETED', 'PROCESS_SPAWNED', 'TASK_ID_ASSIGNED', 'STARTED'].includes(event)) {
-          this._saveClusters();
-        }
-      });
-
-      // Watch for stale agent detection (informational only - NEVER kills tasks)
-      // CHANGED: Stale detection is informational only - never kills tasks
-      messageBus.on('topic:AGENT_LIFECYCLE', (message) => {
-        if (message.content?.data?.event !== 'AGENT_STALE_WARNING') return;
-
-        const agentId = message.content?.data?.agent;
-        const timeSinceLastOutput = message.content?.data?.timeSinceLastOutput;
-        const analysis = message.content?.data?.analysis || 'No analysis available';
-
-        this._log(
-          `⚠️  Orchestrator: Agent ${agentId} appears stale (${Math.round(timeSinceLastOutput / 1000)}s no output) but will NOT be killed`
-        );
-        this._log(`    Analysis: ${analysis}`);
-        this._log(
-          `    Manual intervention may be needed - use 'zeroshot resume ${clusterId}' if stuck`
-        );
-      });
-
-      // Watch for CLUSTER_OPERATIONS - dynamic agent spawn/removal/update
-      // Conductor (or any agent) can publish operation chains to modify the cluster
-      messageBus.subscribe((message) => {
-        if (message.topic === 'CLUSTER_OPERATIONS' && message.cluster_id === clusterId) {
-          let operations = message.content?.data?.operations;
-
-          // Parse operations if they came as a JSON string (template variable serialization)
-          if (typeof operations === 'string') {
-            try {
-              operations = JSON.parse(operations);
-            } catch (e) {
-              this._log(`⚠️ CLUSTER_OPERATIONS has invalid operations JSON: ${e.message}`);
-              return;
-            }
-          }
-
-          if (!operations || !Array.isArray(operations)) {
-            this._log(`⚠️ CLUSTER_OPERATIONS missing operations array, ignoring`);
-            return;
-          }
-
-          this._log(`\n${'='.repeat(80)}`);
-          this._log(`🔧 CLUSTER_OPERATIONS received from ${message.sender}`);
-          this._log(`${'='.repeat(80)}`);
-          if (message.content?.data?.reasoning) {
-            this._log(`Reasoning: ${message.content.data.reasoning}`);
-          }
-          this._log(`Operations: ${operations.length}`);
-          this._log(`${'='.repeat(80)}\n`);
-
-          // Execute operation chain
-          this._handleOperations(clusterId, operations, message.sender, {
-            isolationManager,
-            containerId,
-          }).catch((err) => {
-            console.error(`Failed to execute CLUSTER_OPERATIONS:`, err.message);
-            // Publish failure message
-            messageBus.publish({
-              cluster_id: clusterId,
-              topic: 'CLUSTER_OPERATIONS_FAILED',
-              sender: 'orchestrator',
-              content: {
-                text: `Operation chain failed: ${err.message}`,
-                data: {
-                  error: err.message,
-                  operations: operations,
-                },
-              },
-            });
-
-            // CRITICAL: Stop cluster on operation failure - cluster cannot continue
-            // without required agents (e.g., planner model mismatch)
-            this._log(`\n${'='.repeat(80)}`);
-            this._log(`❌ CLUSTER_OPERATIONS FAILED - STOPPING CLUSTER`);
-            this._log(`${'='.repeat(80)}`);
-            this._log(`Error: ${err.message}`);
-            this._log(`${'='.repeat(80)}\n`);
-
-            this.stop(clusterId).catch((stopErr) => {
-              console.error(`Failed to stop cluster after operation failure:`, stopErr.message);
-            });
-          });
-        }
-      });
 
       // DISABLED: Idle timeout auto-stop mechanism
       // WHY DISABLED: Clusters should only stop on explicit signals:
