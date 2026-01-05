@@ -139,9 +139,11 @@ zeroshot purge                 # NUCLEAR: kill all + delete all
 <details>
 <summary><strong>FAQ</strong></summary>
 
-**Q: Why Claude-only?**
+**Q: Why Claude-only (for now)?**
 
 Claude Code is the most capable agentic coding tool available. We wrap it directly - same tools, same reliability, no custom implementations to break.
+
+Multi-model support (Codex CLI, Gemini CLI) is planned - see [#19](https://github.com/covibes/zeroshot/issues/19).
 
 **Q: Why do single-agent coding sessions get sloppy?**
 
@@ -348,7 +350,8 @@ Full isolation in a fresh container. Your workspace stays untouched. Good for ri
 | Running multiple tasks in parallel | `--docker` |
 | Full automation, no review needed | `--ship` |
 
-### Docker Credential Mounts
+<details>
+<summary><strong>Docker Credential Mounts</strong></summary>
 
 When using `--docker`, zeroshot mounts credential directories so Claude can access tools like AWS, Azure, kubectl.
 
@@ -393,6 +396,8 @@ zeroshot run 123 --docker --container-home /home/node
 ```bash
 zeroshot settings set dockerEnvPassthrough '["MY_API_KEY", "TF_VAR_*"]'
 ```
+
+</details>
 
 ---
 

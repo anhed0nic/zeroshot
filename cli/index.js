@@ -46,6 +46,7 @@ const {
   coerceValue,
   DEFAULT_SETTINGS,
 } = require('../lib/settings');
+const { MOUNT_PRESETS, resolveEnvs } = require('../lib/docker-config');
 const { requirePreflight } = require('../src/preflight');
 const { checkFirstRun } = require('./lib/first-run');
 const { checkForUpdates } = require('./lib/update-checker');
@@ -2763,19 +2764,112 @@ program
 // Settings management
 const settingsCmd = program.command('settings').description('Manage zeroshot settings');
 
+/**
+ * Format settings list with grouped Docker configuration
+ * Docker mounts shown as expanded table instead of raw JSON
+ */
+function formatSettingsList(settings, showUsage = false) {
+  const DOCKER_KEYS = ['dockerMounts', 'dockerEnvPassthrough', 'dockerContainerHome'];
+
+  console.log(chalk.bold('\nCrew Settings:\n'));
+
+  // Non-docker settings first
+  for (const [key, value] of Object.entries(settings)) {
+    if (DOCKER_KEYS.includes(key)) continue;
+
+    const isDefault = JSON.stringify(DEFAULT_SETTINGS[key]) === JSON.stringify(value);
+    const label = isDefault ? chalk.dim(key) : chalk.cyan(key);
+    const val = isDefault ? chalk.dim(String(value)) : chalk.white(String(value));
+    console.log(`  ${label.padEnd(30)} ${val}`);
+  }
+
+  // Docker configuration section (collapsible/grouped)
+  console.log('');
+  console.log(chalk.bold('  Docker Configuration:'));
+
+  const containerHome = settings.dockerContainerHome || '/root';
+  const mounts = settings.dockerMounts || [];
+  const envPassthrough = settings.dockerEnvPassthrough || [];
+
+  // Count presets vs custom mounts
+  const presets = mounts.filter((m) => typeof m === 'string');
+  const customMounts = mounts.filter((m) => typeof m === 'object');
+
+  // Mounts header with count
+  const mountLabel =
+    customMounts.length > 0
+      ? `Mounts (${presets.length} presets, ${customMounts.length} custom):`
+      : `Mounts (${presets.length} presets):`;
+  console.log(chalk.dim(`    ${mountLabel}`));
+
+  // Display each mount as a formatted row
+  for (const mount of mounts) {
+    if (typeof mount === 'string') {
+      const preset = MOUNT_PRESETS[mount];
+      if (preset) {
+        const container = preset.container.replace(/\$HOME/g, containerHome);
+        const rwFlag = preset.readonly ? chalk.dim('ro') : chalk.green('rw');
+        console.log(
+          `      ${chalk.cyan(mount.padEnd(10))} ${chalk.dim(preset.host.padEnd(20))} → ${container.padEnd(24)} (${rwFlag})`
+        );
+      } else {
+        console.log(`      ${chalk.red(mount.padEnd(10))} ${chalk.red('(unknown preset)')}`);
+      }
+    } else {
+      // Custom mount object
+      const container = mount.container.replace(/\$HOME/g, containerHome);
+      const rwFlag = mount.readonly !== false ? chalk.dim('ro') : chalk.green('rw');
+      console.log(
+        `      ${chalk.yellow('custom'.padEnd(10))} ${chalk.dim(mount.host.padEnd(20))} → ${container.padEnd(24)} (${rwFlag})`
+      );
+    }
+  }
+
+  if (mounts.length === 0) {
+    console.log(chalk.dim('      (none)'));
+  }
+
+  // Environment variables (resolved from presets + explicit)
+  const resolvedEnvs = resolveEnvs(mounts, envPassthrough);
+  if (resolvedEnvs.length > 0) {
+    console.log(chalk.dim(`    Environment (${resolvedEnvs.length} vars):`));
+    // Group by source for clarity
+    const fromPresets = resolvedEnvs.filter((e) => !envPassthrough.includes(e));
+    const explicit = envPassthrough;
+
+    if (fromPresets.length > 0) {
+      console.log(`      ${chalk.dim('From presets:')} ${fromPresets.join(', ')}`);
+    }
+    if (explicit.length > 0) {
+      console.log(`      ${chalk.cyan('Explicit:')} ${explicit.join(', ')}`);
+    }
+  } else {
+    console.log(chalk.dim('    Environment: (none)'));
+  }
+
+  // Container home
+  const homeIsDefault = containerHome === '/root';
+  const homeLabel = homeIsDefault ? chalk.dim('Container home:') : chalk.cyan('Container home:');
+  const homeVal = homeIsDefault ? chalk.dim(containerHome) : chalk.white(containerHome);
+  console.log(`    ${homeLabel} ${homeVal}`);
+
+  console.log('');
+
+  if (showUsage) {
+    console.log(chalk.dim('Usage:'));
+    console.log(chalk.dim('  zeroshot settings set <key> <value>'));
+    console.log(chalk.dim('  zeroshot settings get <key>'));
+    console.log(chalk.dim('  zeroshot settings reset'));
+    console.log('');
+  }
+}
+
 settingsCmd
   .command('list')
   .description('Show all settings')
   .action(() => {
     const settings = loadSettings();
-    console.log(chalk.bold('\nCrew Settings:\n'));
-    for (const [key, value] of Object.entries(settings)) {
-      const isDefault = DEFAULT_SETTINGS[key] === value;
-      const label = isDefault ? chalk.dim(key) : chalk.cyan(key);
-      const val = isDefault ? chalk.dim(String(value)) : chalk.white(String(value));
-      console.log(`  ${label.padEnd(30)} ${val}`);
-    }
-    console.log('');
+    formatSettingsList(settings, false);
   });
 
 settingsCmd
@@ -2855,21 +2949,8 @@ settingsCmd
 
 // Add alias for settings list (just `zeroshot settings`)
 settingsCmd.action(() => {
-  // Default action when no subcommand - show list
   const settings = loadSettings();
-  console.log(chalk.bold('\nCrew Settings:\n'));
-  for (const [key, value] of Object.entries(settings)) {
-    const isDefault = DEFAULT_SETTINGS[key] === value;
-    const label = isDefault ? chalk.dim(key) : chalk.cyan(key);
-    const val = isDefault ? chalk.dim(String(value)) : chalk.white(String(value));
-    console.log(`  ${label.padEnd(30)} ${val}`);
-  }
-  console.log('');
-  console.log(chalk.dim('Usage:'));
-  console.log(chalk.dim('  zeroshot settings set <key> <value>'));
-  console.log(chalk.dim('  zeroshot settings get <key>'));
-  console.log(chalk.dim('  zeroshot settings reset'));
-  console.log('');
+  formatSettingsList(settings, true);
 });
 
 // Update command
