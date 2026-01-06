@@ -6,13 +6,13 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
-  # Manual trigger for testing
+  # Manual trigger for DRY-RUN ONLY (testing release process)
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry run (no publish)'
-        required: false
-        default: false
+        description: 'Dry run ONLY (no publish allowed)'
+        required: true
+        default: true
         type: boolean
 
 permissions:
@@ -23,8 +23,12 @@ permissions:
 
 jobs:
   release:
-    # Skip if triggered by workflow_run and CI failed
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # SAFETY: Only run if CI passed OR manual dry-run
+    # Real releases MUST go through CI (workflow_run with success)
+    # Manual trigger MUST be dry-run only (cannot publish untested code)
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.dry_run == true) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,8 +80,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
+          # SAFETY: Manual triggers MUST be dry-run only
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "⚠️  Manual trigger detected - enforcing dry-run mode"
+            npx semantic-release --dry-run
+          elif [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "ℹ️  Dry-run mode enabled"
             npx semantic-release --dry-run
           else
+            echo "🚀 Publishing release (triggered by CI passing)"
             npx semantic-release
           fi
