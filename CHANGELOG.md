@@ -1,3 +1,17 @@
+# [5.0.0](https://github.com/covibes/zeroshot/compare/v4.2.0...v5.0.0) (2026-01-07)
+
+
+* feat!: remove interactive setup wizard ([5438953](https://github.com/covibes/zeroshot/commit/54389536e478be1dce0ab707ac7ef8e4ef6ce26d))
+
+
+### BREAKING CHANGES
+
+* Interactive setup wizard removed. Configure via:
+  zeroshot settings set maxModel opus
+  zeroshot settings set dockerMounts '["gh","git","ssh"]'
+
+Closes: Setup wizard blocking non-interactive usage
+
 # [4.2.0](https://github.com/covibes/zeroshot/compare/v4.1.4...v4.2.0) (2026-01-06)
 
 
