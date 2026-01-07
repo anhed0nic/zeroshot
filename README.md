@@ -10,6 +10,23 @@
 
 **Multi-agent coding CLI built on Claude Code.**
 
+## Install
+
+**Platforms**: Linux, macOS
+
+```bash
+npm install -g @covibes/zeroshot
+```
+
+**Requires**: Node 18+, [Claude Code CLI](https://claude.com/product/claude-code), [GitHub CLI](https://cli.github.com/)
+
+```bash
+npm i -g @anthropic-ai/claude-code && claude auth login
+gh auth login
+```
+
+---
+
 You know the problem. Your AI agent:
 
 - Says "tests pass" (never ran them)
@@ -81,23 +98,6 @@ A single agent would say "done!" after the first implementation. Here, the adver
 Crash recovery (`zeroshot resume`) means multi-hour tasks survive interruptions.
 
 **Rule of thumb:** If you can't describe what "done" looks like, zeroshot's validators can't verify it.
-
----
-
-## Install
-
-**Platforms**: Linux, macOS
-
-```bash
-npm install -g @covibes/zeroshot
-```
-
-**Requires**: Node 18+, [Claude Code CLI](https://claude.com/product/claude-code), [GitHub CLI](https://cli.github.com/)
-
-```bash
-npm i -g @anthropic-ai/claude-code && claude auth login
-gh auth login
-```
 
 ---
 
