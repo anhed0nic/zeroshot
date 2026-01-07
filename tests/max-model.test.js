@@ -258,8 +258,8 @@ describe('maxModel Ceiling Enforcement', function () {
         mockSpawnFn: () => {},
       });
 
-      // Default maxModel is sonnet
-      assert.strictEqual(agent._selectModel(), 'sonnet');
+      // Default maxModel is opus (no restriction by default)
+      assert.strictEqual(agent._selectModel(), 'opus');
     });
 
     it('should use maxModel=opus as default when configured', function () {

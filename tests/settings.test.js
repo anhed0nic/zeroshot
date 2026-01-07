@@ -62,7 +62,7 @@ describe('Settings System', function () {
   it('should have correct default settings', function () {
     const { DEFAULT_SETTINGS } = settingsModule;
 
-    assert.strictEqual(DEFAULT_SETTINGS.maxModel, 'sonnet');
+    assert.strictEqual(DEFAULT_SETTINGS.maxModel, 'opus');
     assert.strictEqual(DEFAULT_SETTINGS.defaultConfig, 'conductor-bootstrap');
     assert.strictEqual(DEFAULT_SETTINGS.defaultDocker, false);
     assert.strictEqual(DEFAULT_SETTINGS.strictSchema, true);
@@ -81,7 +81,7 @@ describe('Settings System', function () {
 
     const settings = loadSettings();
 
-    assert.strictEqual(settings.maxModel, 'sonnet');
+    assert.strictEqual(settings.maxModel, 'opus');
     assert.strictEqual(settings.defaultConfig, 'conductor-bootstrap');
     assert.strictEqual(settings.defaultDocker, false);
     assert.strictEqual(settings.strictSchema, true);
