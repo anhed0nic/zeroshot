@@ -52,15 +52,25 @@ exit 0
     proc.stderr.on('data', (d) => (output += d.toString()));
 
     proc.on('close', () => {
-      // Wait for watcher process to invoke mock
-      setTimeout(() => {
-        expect(fs.existsSync(mockLog), 'Mock script should have been invoked').to.be.true;
-        const log = fs.readFileSync(mockLog, 'utf8');
-        expect(log).to.include('INVOKED');
-        expect(log).to.include('--print');
-        expect(log).to.include('test prompt');
-        done();
-      }, 2000);
+      // Wait for watcher process to invoke mock (CI can be slow)
+      const checkLog = (attempts = 0) => {
+        setTimeout(() => {
+          if (!fs.existsSync(mockLog)) {
+            if (attempts < 10) return checkLog(attempts + 1);
+            return done(new Error('Mock script was never invoked'));
+          }
+          const log = fs.readFileSync(mockLog, 'utf8');
+          // Check if task invocation happened (not just --version from preflight)
+          if (!log.includes('--print') && attempts < 10) {
+            return checkLog(attempts + 1);
+          }
+          expect(log).to.include('INVOKED');
+          expect(log).to.include('--print');
+          expect(log).to.include('test prompt');
+          done();
+        }, 1000);
+      };
+      checkLog();
     });
   });
 
@@ -74,14 +84,25 @@ exit 0
     });
 
     proc.on('close', () => {
-      setTimeout(() => {
-        expect(fs.existsSync(mockLog)).to.be.true;
-        const log = fs.readFileSync(mockLog, 'utf8');
-        // extra-arg should appear before --print (prepended to args)
-        expect(log).to.include('extra-arg');
-        expect(log).to.include('--print');
-        done();
-      }, 2000);
+      // Wait for watcher process to invoke mock (CI can be slow)
+      const checkLog = (attempts = 0) => {
+        setTimeout(() => {
+          if (!fs.existsSync(mockLog)) {
+            if (attempts < 10) return checkLog(attempts + 1);
+            return done(new Error('Mock script was never invoked'));
+          }
+          const log = fs.readFileSync(mockLog, 'utf8');
+          // Check if task invocation happened (not just --version from preflight)
+          if (!log.includes('--print') && attempts < 10) {
+            return checkLog(attempts + 1);
+          }
+          // extra-arg should appear before --print (prepended to args)
+          expect(log).to.include('extra-arg');
+          expect(log).to.include('--print');
+          done();
+        }, 1000);
+      };
+      checkLog();
     });
   });
 });
