@@ -1,3 +1,10 @@
+# [5.1.0](https://github.com/covibes/zeroshot/compare/v5.0.0...v5.1.0) (2026-01-07)
+
+
+### Features
+
+* add preflight check for root user ([802f0f4](https://github.com/covibes/zeroshot/commit/802f0f41e27c1aa585dec31217fa2aeb3c9ba3db))
+
 # [5.0.0](https://github.com/covibes/zeroshot/compare/v4.2.0...v5.0.0) (2026-01-07)
 
 
