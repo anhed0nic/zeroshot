@@ -16,6 +16,12 @@ const Orchestrator = require('../src/orchestrator.js');
 const MockTaskRunner = require('./helpers/mock-task-runner.js');
 const LedgerAssertions = require('./helpers/ledger-assertions.js');
 
+// Isolate tests from user settings (prevents minModel/maxModel conflicts)
+const testSettingsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zeroshot-test-settings-'));
+const testSettingsFile = path.join(testSettingsDir, 'settings.json');
+fs.writeFileSync(testSettingsFile, JSON.stringify({ maxModel: 'opus', minModel: null }));
+process.env.ZEROSHOT_SETTINGS_FILE = testSettingsFile;
+
 // Test utilities
 function createTempDir() {
   const tmpBase = path.join(os.tmpdir(), 'zeroshot-test');
