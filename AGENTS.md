@@ -218,6 +218,143 @@ later via conductor classification missed it.
 Fix: added cwd injection to `_opAddAgents()` and resume path in `orchestrator.js`.
 Test: `tests/worktree-cwd-injection.test.js`.
 
+## Enforcement Philosophy
+
+**ENFORCE > DOCUMENT. If enforceable, don't document.**
+
+Preference: Type system > ESLint > Pre-commit hook > Documentation
+
+Error messages ARE the documentation. Write them with what + fix.
+
+## Anti-Patterns (Zeroshot-Specific)
+
+### 1. Running Zeroshot Without Permission
+
+```bash
+# ❌ FORBIDDEN
+agent: "I'll run zeroshot on issue #123"
+zeroshot run 123
+
+# ✅ CORRECT
+agent: "Would you like me to run zeroshot on issue #123?"
+# Wait for user consent
+```
+
+WHY: Multi-agent runs consume significant API credits.
+
+### 2. Git Commands in Validator Prompts
+
+```bash
+# ❌ FORBIDDEN
+validator_prompt: "Run git diff to verify changes..."
+
+# ✅ CORRECT
+validator_prompt: "Read src/index.js and verify function exists..."
+```
+
+WHY: Multiple agents modify git state concurrently. Validator reads stale state.
+
+### 3. Asking Questions in Autonomous Workflows
+
+```javascript
+// ❌ FORBIDDEN
+await AskUserQuestion('Should I use approach A or B?');
+
+// ✅ CORRECT
+// Decision: Using approach A because requirement specifies X
+```
+
+WHY: Zeroshot agents run non-interactively.
+
+### 4. Worker Git Operations Without Isolation
+
+```bash
+# ❌ FORBIDDEN
+zeroshot run 123  # Pollutes main directory
+
+# ✅ CORRECT
+zeroshot run 123 --worktree  # Isolated
+zeroshot run 123 --pr        # Worktree + PR
+zeroshot run 123 --docker    # Full isolation
+```
+
+WHY: Prevents contamination, enables parallel work.
+
+### 5. Using Git Stash
+
+```bash
+# ❌ FORBIDDEN
+git stash  # Hides work from other agents
+
+# ✅ CORRECT
+git add -A && git commit -m "WIP: feature implementation"
+git switch other-branch
+```
+
+WHY: WIP commits are visible, never lost, squashable.
+
+## Behavioral Rules
+
+### Git Workflow (Multi-Agent)
+
+Use WIP commits instead of stashing:
+
+```bash
+git add -A && git commit -m "WIP: save work"  # Instead of git stash
+git switch <branch>                            # Instead of git checkout
+git restore <file>                             # Instead of git checkout --
+```
+
+### Test-First Workflow
+
+Write tests BEFORE or WITH code:
+
+```bash
+touch src/new-feature.js
+touch tests/new-feature.test.js  # FIRST
+# Write failing tests → Implement → Pass
+```
+
+### Validation Workflow
+
+Run validation for:
+
+- Significant changes (>50 lines)
+- Refactoring across files
+- When user explicitly requests
+
+Trust pre-commit hooks for trivial changes.
+
+```bash
+npm run lint
+npm run test
+```
+
+## CI Failure Diagnosis
+
+Multiple CI jobs fail → Diagnose each independently.
+
+1. Get exact status: `gh api repos/covibes/zeroshot/actions/runs/{RUN_ID}/jobs`
+2. Read ACTUAL error: `gh api repos/covibes/zeroshot/actions/jobs/{JOB_ID}/logs`
+3. Fix ONE error → Push → Rerun → Repeat
+
+Do NOT assume single root cause.
+
+## CLAUDE.md Writing Rules
+
+**Scope:** Narrowest possible.
+
+**Content Priority:**
+
+1. CRITICAL gotchas (caused real bugs)
+2. "Where to Look" routing tables
+3. Anti-patterns with WHY
+4. Commands/troubleshooting
+
+**DELETE:** Tutorial content, directory trees, interface definitions
+
+**Format:** Tables over prose, ❌/✅ examples with WHY
+
 ## Mechanical Enforcement
 
 | Antipattern               | Enforcement      |
@@ -226,3 +363,5 @@ Test: `tests/worktree-cwd-injection.test.js`.
 | Manual git tags           | Pre-push hook    |
 | Git in validator prompts  | Config validator |
 | Multiple impl files (-v2) | Pre-commit hook  |
+| Spawn without permission  | Runtime check    |
+| Git stash usage           | Pre-commit hook  |
