@@ -23,6 +23,18 @@ const { generateName } = require('./name-generator');
 const configValidator = require('./config-validator');
 const TemplateResolver = require('./template-resolver');
 
+function applyModelOverride(agentConfig, modelOverride) {
+  if (!modelOverride) return;
+
+  agentConfig.model = modelOverride;
+  if (agentConfig.modelRules) {
+    delete agentConfig.modelRules;
+  }
+  if (agentConfig.modelConfig) {
+    delete agentConfig.modelConfig;
+  }
+}
+
 /**
  * Operation Chain Schema
  * Conductor (or any agent) can publish CLUSTER_OPERATIONS to dynamically modify cluster
@@ -257,9 +269,14 @@ class Orchestrator {
           this._log(`[Orchestrator] Fixed missing cwd for agent ${agentConfig.id}: ${agentCwd}`);
         }
 
+        if (clusterData.modelOverride) {
+          applyModelOverride(agentConfig, clusterData.modelOverride);
+        }
+
         const agentOptions = {
           id: clusterId,
           quiet: this.quiet,
+          modelOverride: clusterData.modelOverride || null,
         };
 
         // Inject isolation context if enabled (MUST be done during agent creation)
@@ -301,6 +318,7 @@ class Orchestrator {
       messageBus,
       agents,
       isolation,
+      autoPr: clusterData.autoPr || false,
     };
 
     this.clusters.set(clusterId, cluster);
@@ -401,6 +419,10 @@ class Orchestrator {
           pid: cluster.state === 'running' ? cluster.pid : null,
           // Persist failure info for resume capability
           failureInfo: cluster.failureInfo || null,
+          // Persist PR mode for completion agent selection
+          autoPr: cluster.autoPr || false,
+          // Persist model override for consistent agent spawning on resume
+          modelOverride: cluster.modelOverride || null,
           // Persist isolation info (excluding manager instance which can't be serialized)
           // CRITICAL: workDir is required for resume() to recreate container with same workspace
           isolation: cluster.isolation
@@ -552,6 +574,7 @@ class Orchestrator {
       isolationImage: options.isolationImage,
       worktree: options.worktree || false,
       autoPr: options.autoPr || process.env.ZEROSHOT_PR === '1',
+      modelOverride: options.modelOverride, // Model override for all agents
     });
   }
 
@@ -631,6 +654,9 @@ class Orchestrator {
       // Initialization completion tracking (for safe SIGINT handling)
       initCompletePromise,
       _resolveInitComplete: resolveInitComplete,
+      autoPr: options.autoPr || false,
+      // Model override for all agents (applied to dynamically added agents)
+      modelOverride: options.modelOverride || null,
       // Isolation state (only if enabled)
       // CRITICAL: Store workDir for resume capability - without this, resume() can't recreate container
       isolation: options.isolation
@@ -731,9 +757,16 @@ class Orchestrator {
           agentConfig.cwd = agentCwd;
         }
 
+        // Apply model override if set (for consistency across all agents)
+        if (options.modelOverride) {
+          applyModelOverride(agentConfig, options.modelOverride);
+          this._log(`    [model] Overridden model for ${agentConfig.id}: ${options.modelOverride}`);
+        }
+
         const agentOptions = {
           testMode: options.testMode || !!this.taskRunner, // Enable testMode if taskRunner provided
           quiet: this.quiet,
+          modelOverride: options.modelOverride || null,
         };
 
         // Inject mock spawn function if provided (legacy mockExecutor API)
@@ -1743,6 +1776,12 @@ Continue from where you left off. Review your previous output to understand what
         agentConfig.cwd = agentCwd;
         this._log(`    [cwd] Injected worktree cwd for ${agentConfig.id}: ${agentCwd}`);
       }
+
+      // Apply model override if set (for consistency with initial agents)
+      if (cluster.modelOverride) {
+        applyModelOverride(agentConfig, cluster.modelOverride);
+        this._log(`    [model] Overridden model for ${agentConfig.id}: ${cluster.modelOverride}`);
+      }
       // Validate agent config has required fields
       if (!agentConfig.id) {
         throw new Error('Agent config missing required field: id');
@@ -1765,6 +1804,7 @@ Continue from where you left off. Review your previous output to understand what
       const agentOptions = {
         testMode: !!this.taskRunner, // Enable testMode if taskRunner provided
         quiet: this.quiet,
+        modelOverride: cluster.modelOverride || null,
       };
 
       // TaskRunner DI - propagate to dynamically spawned agents
@@ -1958,7 +1998,7 @@ Continue from where you left off. Review your previous output to understand what
       return;
     }
 
-    const isPrMode = process.env.ZEROSHOT_PR === '1';
+    const isPrMode = cluster.autoPr || process.env.ZEROSHOT_PR === '1';
 
     if (isPrMode) {
       // Load git-pusher for PR mode

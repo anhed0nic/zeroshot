@@ -73,9 +73,7 @@ let activeStatusFooter = null;
  * @param {...any} args - Arguments to print (like console.log)
  */
 function safePrint(...args) {
-  const text = args.map(arg =>
-    typeof arg === 'string' ? arg : String(arg)
-  ).join(' ');
+  const text = args.map((arg) => (typeof arg === 'string' ? arg : String(arg))).join(' ');
 
   if (activeStatusFooter) {
     activeStatusFooter.print(text + '\n');
@@ -454,13 +452,23 @@ program
     '--strict-schema',
     'Enforce JSON schema via CLI (no live streaming). Default: live streaming with local validation'
   )
-  .option('--pr', 'Create PR for human review (uses worktree isolation by default, use --docker for Docker)')
-  .option('--ship', 'Full automation: worktree isolation + PR + auto-merge (use --docker for Docker)')
+  .option(
+    '--pr',
+    'Create PR for human review (uses worktree isolation by default, use --docker for Docker)'
+  )
+  .option(
+    '--ship',
+    'Full automation: worktree isolation + PR + auto-merge (use --docker for Docker)'
+  )
   .option('--workers <n>', 'Max sub-agents for worker to spawn in parallel', parseInt)
+  .option('--model <model>', 'Override all agent models (opus, sonnet, haiku)')
   .option('-d, --detach', 'Run in background (default: attach to first agent)')
   .option('--mount <spec...>', 'Add Docker mount (host:container[:ro]). Repeatable.')
   .option('--no-mounts', 'Disable all Docker credential mounts')
-  .option('--container-home <path>', 'Container home directory for $HOME expansion (default: /root)')
+  .option(
+    '--container-home <path>',
+    'Container home directory for $HOME expansion (default: /root)'
+  )
   .addHelpText(
     'after',
     `
@@ -575,6 +583,7 @@ Input formats:
             ZEROSHOT_PR: options.pr ? '1' : '',
             ZEROSHOT_WORKTREE: options.worktree ? '1' : '',
             ZEROSHOT_WORKERS: options.workers?.toString() || '',
+            ZEROSHOT_MODEL: options.model || '',
             ZEROSHOT_CWD: targetCwd, // Explicit CWD for orchestrator
           },
         });
@@ -644,19 +653,42 @@ Input formats:
         }
       }
 
+      // Apply model override to all agents (CLI > env)
+      const modelOverride = options.model || process.env.ZEROSHOT_MODEL;
+      if (modelOverride) {
+        // Validate model against maxModel ceiling
+        const { validateModelAgainstMax } = require('../lib/settings');
+        try {
+          validateModelAgainstMax(modelOverride, settings.maxModel);
+        } catch (err) {
+          console.error(chalk.red(`Error: ${err.message}`));
+          process.exit(1);
+        }
+
+        // Override all agent models
+        for (const agent of config.agents) {
+          agent.model = modelOverride;
+          if (agent.modelRules) {
+            delete agent.modelRules;
+          }
+        }
+        console.log(chalk.dim(`Model override: ${modelOverride} (all agents)`));
+      }
+
       // Build start options (CLI flags > env vars > settings)
       // In foreground mode, use CLI options directly; in daemon mode, use env vars
       // CRITICAL: cwd must be passed to orchestrator for agent CWD propagation
       const targetCwd = process.env.ZEROSHOT_CWD || detectGitRepoRoot();
       const startOptions = {
         cwd: targetCwd, // Target working directory for agents
-        isolation:
-          options.docker || process.env.ZEROSHOT_DOCKER === '1' || settings.defaultDocker,
+        isolation: options.docker || process.env.ZEROSHOT_DOCKER === '1' || settings.defaultDocker,
         isolationImage: options.dockerImage || process.env.ZEROSHOT_DOCKER_IMAGE || undefined,
         worktree: options.worktree || process.env.ZEROSHOT_WORKTREE === '1',
         autoPr: options.pr || process.env.ZEROSHOT_PR === '1',
         autoMerge: process.env.ZEROSHOT_MERGE === '1',
         autoPush: process.env.ZEROSHOT_PUSH === '1',
+        // Model override (for dynamically added agents)
+        modelOverride: modelOverride || undefined,
         // Docker mount options
         noMounts: options.noMounts || false,
         mounts: options.mount ? parseMountSpecs(options.mount) : undefined,
@@ -997,7 +1029,8 @@ program
         for (const cluster of enrichedClusters) {
           const created = new Date(cluster.createdAt).toLocaleString();
           const tokenDisplay = cluster.totalTokens > 0 ? cluster.totalTokens.toLocaleString() : '-';
-          const costDisplay = cluster.totalCostUsd > 0 ? '$' + cluster.totalCostUsd.toFixed(3) : '-';
+          const costDisplay =
+            cluster.totalCostUsd > 0 ? '$' + cluster.totalCostUsd.toFixed(3) : '-';
 
           // Highlight zombie clusters in red
           const stateDisplay =
@@ -1760,9 +1793,7 @@ Key bindings:
           const status = orchestrator.getStatus(id);
           // Agent is "active" if in any working state
           // Note: currentTaskId may be null briefly between TASK_STARTED and TASK_ID_ASSIGNED
-          const activeAgents = status.agents.filter(
-            (a) => ACTIVE_STATES.has(a.state)
-          );
+          const activeAgents = status.agents.filter((a) => ACTIVE_STATES.has(a.state));
 
           if (activeAgents.length === 0) {
             console.error(chalk.yellow(`No agents currently executing tasks in cluster ${id}`));
@@ -1813,10 +1844,16 @@ Key bindings:
           if (!agent.currentTaskId) {
             if (ACTIVE_STATES.has(agent.state)) {
               // Agent is working but task ID not yet assigned
-              console.error(chalk.yellow(`Agent '${options.agent}' is working (state: ${agent.state}, task ID not yet assigned)`));
+              console.error(
+                chalk.yellow(
+                  `Agent '${options.agent}' is working (state: ${agent.state}, task ID not yet assigned)`
+                )
+              );
               console.log(chalk.dim('Try again in a moment...'));
             } else {
-              console.error(chalk.yellow(`Agent '${options.agent}' is not currently running a task`));
+              console.error(
+                chalk.yellow(`Agent '${options.agent}' is not currently running a task`)
+              );
               console.log(chalk.dim(`State: ${agent.state}`));
             }
             return;
@@ -2871,7 +2908,9 @@ function formatSettingsList(settings, showUsage = false) {
     console.log(chalk.dim('  zeroshot settings set dockerMounts \'["gh","git","ssh","aws"]\''));
     console.log(chalk.dim('  zeroshot settings set dockerEnvPassthrough \'["AWS_*","TF_VAR_*"]\''));
     console.log('');
-    console.log(chalk.dim('Available mount presets: gh, git, ssh, aws, azure, kube, terraform, gcloud'));
+    console.log(
+      chalk.dim('Available mount presets: gh, git, ssh, aws, azure, kube, terraform, gcloud')
+    );
     console.log('');
   }
 }
@@ -4436,9 +4475,7 @@ function printMessage(msg, showClusterId = false, watchMode = false, isActive = 
 
   // IMPLEMENTATION_READY: milestone marker
   if (msg.topic === 'IMPLEMENTATION_READY') {
-    safePrint(
-      `${prefix} ${chalk.gray(timestamp)} ${chalk.bold.yellow('✅ IMPLEMENTATION READY')}`
-    );
+    safePrint(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.yellow('✅ IMPLEMENTATION READY')}`);
     if (msg.content?.data?.commit) {
       safePrint(
         `${prefix} ${chalk.gray('Commit:')} ${chalk.cyan(msg.content.data.commit.substring(0, 8))}`
@@ -4492,7 +4529,10 @@ function printMessage(msg, showClusterId = false, watchMode = false, isActive = 
 
 // Main async entry point
 async function main() {
-  const isQuiet = process.argv.includes('-q') || process.argv.includes('--quiet') || process.env.NODE_ENV === 'test';
+  const isQuiet =
+    process.argv.includes('-q') ||
+    process.argv.includes('--quiet') ||
+    process.env.NODE_ENV === 'test';
 
   // Check for updates (non-blocking if offline)
   await checkForUpdates({ quiet: isQuiet });

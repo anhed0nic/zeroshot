@@ -36,6 +36,7 @@ class SubClusterWrapper {
     this.childClusterId = null;
 
     this.quiet = options.quiet || false;
+    this.modelOverride = options.modelOverride || null;
   }
 
   /**
@@ -351,7 +352,7 @@ class SubClusterWrapper {
     const childCluster = await childOrchestrator.start(
       this.config.config, // Child cluster config
       { text: context },
-      { testMode: false }
+      { testMode: false, modelOverride: this.modelOverride || undefined }
     );
 
     // Create message bridge
