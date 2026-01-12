@@ -9,6 +9,7 @@ function safeJsonParse(value, fallback) {
 function parseItem(item) {
   const events = [];
 
+  // Handle assistant messages (Claude-style: type=message, role=assistant)
   if (item.type === 'message' && item.role === 'assistant') {
     const content = Array.isArray(item.content)
       ? item.content
@@ -23,6 +24,11 @@ function parseItem(item) {
       .join('');
     if (text) events.push({ type: 'text', text });
     if (thinking) events.push({ type: 'thinking', text: thinking });
+  }
+
+  // Handle agent messages (Codex-style: type=agent_message, text=string)
+  if (item.type === 'agent_message' && item.text) {
+    events.push({ type: 'text', text: item.text });
   }
 
   if (item.type === 'function_call') {
@@ -63,9 +69,11 @@ function parseEvent(line, options = {}) {
 
   switch (event.type) {
     case 'thread.started':
+    case 'turn.started':
       return null;
 
     case 'item.created':
+    case 'item.completed':
       return parseItem(event.item);
 
     case 'turn.completed': {
@@ -86,7 +94,9 @@ function parseEvent(line, options = {}) {
       };
 
     default:
-      if (options.onUnknown) {
+      // Only log warnings for actual unknown string types, not malformed events
+      // (undefined/object types are just noise from non-standard CLI output)
+      if (options.onUnknown && typeof event.type === 'string') {
         options.onUnknown(event.type, event);
       }
       return null;

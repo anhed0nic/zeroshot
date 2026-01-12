@@ -19,6 +19,9 @@ class OpenAIProvider extends BaseProvider {
     this._unknownEventCounts = new Map();
   }
 
+  // SDK not implemented - uses CLI only
+  // See BaseProvider for SDK extension point documentation
+
   isAvailable() {
     return commandExists(this.cliCommand);
   }
@@ -37,7 +40,9 @@ class OpenAIProvider extends BaseProvider {
 
   getCliFeatures() {
     if (this._cliFeatures) return this._cliFeatures;
-    const help = getHelpOutput(this.cliCommand);
+    // CRITICAL: Check 'codex exec --help' not 'codex --help'
+    // The --output-schema flag is on the exec subcommand, not the main command
+    const help = getHelpOutput(this.cliCommand, ['exec']);
     const unknown = !help;
 
     const features = {
