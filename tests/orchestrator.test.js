@@ -189,7 +189,11 @@ describe('Orchestrator - Cluster Lifecycle (CRITICAL)', function () {
 
       // The orchestrator doesn't validate config structure upfront
       // It will fail when trying to start agents, but cluster is created
-      const result = await orchestrator._startInternal(badConfig, { text: 'Task' }, { testMode: true });
+      const result = await orchestrator._startInternal(
+        badConfig,
+        { text: 'Task' },
+        { testMode: true }
+      );
 
       // Cluster is created even with empty agents
       assert.ok(result.id, 'Cluster ID should be generated');
@@ -252,7 +256,11 @@ describe('Orchestrator - Cluster Lifecycle (CRITICAL)', function () {
 
       const persisted = JSON.parse(fs.readFileSync(clustersFile, 'utf8'));
       assert.ok(persisted[clusterId], 'Cluster should be in clusters.json');
-      assert.strictEqual(persisted[clusterId].state, 'stopped', 'Persisted state should be stopped');
+      assert.strictEqual(
+        persisted[clusterId].state,
+        'stopped',
+        'Persisted state should be stopped'
+      );
     });
 
     it('should fail if cluster does not exist', async function () {
@@ -478,7 +486,7 @@ describe('Orchestrator - Crash Recovery (CRITICAL)', function () {
 
     // Phase 2: New orchestrator instance - auto-loads clusters
     {
-      const orchestrator2 = new Orchestrator({
+      const orchestrator2 = await Orchestrator.create({
         storageDir,
         quiet: true,
         // skipLoad: false (default) - should auto-load
@@ -637,16 +645,17 @@ describe('Orchestrator - Concurrent Operations (Race Conditions)', function () {
     orchestrator.close();
 
     // Create multiple orchestrators that all try to load at once
-    const orchestrators = Array(5)
-      .fill()
-      .map(
-        () =>
-          new Orchestrator({
+    const orchestrators = await Promise.all(
+      Array(5)
+        .fill()
+        .map(() =>
+          Orchestrator.create({
             storageDir,
             quiet: true,
             // skipLoad: false (default) - all load simultaneously
           })
-      );
+        )
+    );
 
     // Verify: All loaded the cluster successfully
     for (const orch of orchestrators) {
@@ -711,8 +720,10 @@ describe('Orchestrator - Error Handling', function () {
 
     // Cluster should still exist and not have crashed (state can be running, stopping, or stopped)
     assert.ok(cluster, 'Cluster should still exist');
-    assert.ok(['running', 'stopping', 'stopped'].includes(cluster.state),
-      `Cluster should be in valid state (got: ${cluster.state})`);
+    assert.ok(
+      ['running', 'stopping', 'stopped'].includes(cluster.state),
+      `Cluster should be in valid state (got: ${cluster.state})`
+    );
   });
 
   it('should handle missing storageDir gracefully', function () {
@@ -827,7 +838,7 @@ describe('Orchestrator - File Locking', function () {
     }
 
     // Load clusters (should acquire lock)
-    const orch2 = new Orchestrator({
+    const orch2 = await Orchestrator.create({
       storageDir,
       quiet: true,
       // skipLoad: false (default)

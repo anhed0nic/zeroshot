@@ -342,7 +342,7 @@ class SubClusterWrapper {
     this.childClusterId = childId;
 
     // Create child orchestrator with separate database
-    const childOrchestrator = new Orchestrator({
+    const childOrchestrator = await Orchestrator.create({
       quiet: this.quiet,
       skipLoad: true,
       storageDir: path.join(this.parentCluster.ledger.dbPath, '..', 'subclusters', childId),

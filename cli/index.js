@@ -190,14 +190,23 @@ function parseMountSpecs(specs) {
 // Lazy-loaded orchestrator (quiet by default) - created on first use
 /** @type {import('../src/orchestrator') | null} */
 let _orchestrator = null;
+/** @type {Promise<import('../src/orchestrator')> | null} */
+let _orchestratorPromise = null;
 /**
- * @returns {import('../src/orchestrator')}
+ * @returns {Promise<import('../src/orchestrator')>}
  */
 function getOrchestrator() {
-  if (!_orchestrator) {
-    _orchestrator = new Orchestrator({ quiet: true });
+  if (_orchestrator) {
+    return Promise.resolve(_orchestrator);
   }
-  return _orchestrator;
+  // Use a promise to prevent multiple concurrent initializations
+  if (!_orchestratorPromise) {
+    _orchestratorPromise = Orchestrator.create({ quiet: true }).then((orch) => {
+      _orchestrator = orch;
+      return orch;
+    });
+  }
+  return _orchestratorPromise;
 }
 
 /**
@@ -633,7 +642,7 @@ Input formats:
       }
 
       // Create orchestrator with clusterId override for foreground mode
-      const orchestrator = getOrchestrator();
+      const orchestrator = await getOrchestrator();
       config = orchestrator.loadConfig(configPath);
 
       if (!config.defaultProvider) {
@@ -1008,8 +1017,8 @@ program
   .action(async (options) => {
     try {
       // Get clusters
-      const clusters = getOrchestrator().listClusters();
-      const orchestrator = getOrchestrator();
+      const clusters = (await getOrchestrator()).listClusters();
+      const orchestrator = await getOrchestrator();
 
       // Enrich clusters with token data
       const enrichedClusters = clusters.map((cluster) => {
@@ -1126,12 +1135,12 @@ program
 
       if (type === 'cluster') {
         // Show cluster status
-        const status = getOrchestrator().getStatus(id);
+        const status = (await getOrchestrator()).getStatus(id);
 
         // Get token usage
         let tokensByRole = null;
         try {
-          const cluster = getOrchestrator().getCluster(id);
+          const cluster = (await getOrchestrator()).getCluster(id);
           if (cluster?.messageBus) {
             tokensByRole = cluster.messageBus.getTokensByRole(id);
           }
@@ -1270,7 +1279,7 @@ program
 
       // === CLUSTER LOGS ===
       const limit = parseInt(options.limit);
-      const quietOrchestrator = new Orchestrator({ quiet: true });
+      const quietOrchestrator = await Orchestrator.create({ quiet: true });
 
       // No ID: show/follow ALL clusters
       if (!id) {
@@ -1681,7 +1690,7 @@ program
   .action(async (clusterId) => {
     try {
       console.log(`Stopping cluster ${clusterId}...`);
-      await getOrchestrator().stop(clusterId);
+      await (await getOrchestrator()).stop(clusterId);
       console.log('Cluster stopped successfully');
     } catch (error) {
       console.error('Error stopping cluster:', error.message);
@@ -1705,7 +1714,7 @@ program
 
       if (type === 'cluster') {
         console.log(`Killing cluster ${id}...`);
-        await getOrchestrator().kill(id);
+        await (await getOrchestrator()).kill(id);
         console.log('Cluster killed successfully');
       } else {
         // Kill task
@@ -1833,7 +1842,7 @@ Key bindings:
 
         // Create orchestrator instance to query agent states
         // This loads the cluster from disk including its ledger and agents
-        const orchestrator = new Orchestrator({ quiet: true });
+        const orchestrator = await Orchestrator.create({ quiet: true });
 
         try {
           const status = orchestrator.getStatus(id);
@@ -2005,7 +2014,7 @@ program
   .action(async (options) => {
     try {
       // Get counts first
-      const orchestrator = getOrchestrator();
+      const orchestrator = await getOrchestrator();
       const clusters = orchestrator.listClusters();
       const runningClusters = clusters.filter(
         (c) => c.state === 'running' || c.state === 'initializing'
@@ -2638,7 +2647,7 @@ program
   .option('-y, --yes', 'Skip confirmation')
   .action(async (options) => {
     try {
-      const orchestrator = getOrchestrator();
+      const orchestrator = await getOrchestrator();
 
       // Get counts first
       const clusters = orchestrator.listClusters();
@@ -2864,7 +2873,7 @@ program
     try {
       const TUI = require('../src/tui');
       const tui = new TUI({
-        orchestrator: getOrchestrator(),
+        orchestrator: await getOrchestrator(),
         refreshRate: parseInt(options.refreshRate, 10),
       });
       await tui.start();

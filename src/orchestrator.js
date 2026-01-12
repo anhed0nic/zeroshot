@@ -79,10 +79,23 @@ class Orchestrator {
     // Track if orchestrator is closed (prevents _saveClusters race conditions during cleanup)
     this.closed = false;
 
-    // Load existing clusters from disk (skip if explicitly disabled)
+    // Track if clusters are loaded (for lazy loading pattern)
+    this._clustersLoaded = options.skipLoad === true;
+  }
+
+  /**
+   * Factory method for async initialization
+   * Use this instead of `new Orchestrator()` for proper async cluster loading
+   * @param {Object} options - Same options as constructor
+   * @returns {Promise<Orchestrator>}
+   */
+  static async create(options = {}) {
+    const instance = new Orchestrator({ ...options, skipLoad: true });
     if (options.skipLoad !== true) {
-      this._loadClusters();
+      await instance._loadClusters();
+      instance._clustersLoaded = true;
     }
+    return instance;
   }
 
   /**
@@ -100,7 +113,7 @@ class Orchestrator {
    * Uses file locking for consistent reads
    * @private
    */
-  _loadClusters() {
+  async _loadClusters() {
     const clustersFile = path.join(this.storageDir, 'clusters.json');
     this._log(`[Orchestrator] Loading clusters from: ${clustersFile}`);
 
@@ -113,30 +126,17 @@ class Orchestrator {
     let release;
 
     try {
-      // Acquire lock (sync API doesn't support retries, so we retry manually)
-      const maxAttempts = 20;
-      const retryDelayMs = 100;
-
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        try {
-          release = lockfile.lockSync(clustersFile, {
-            lockfilePath,
-            stale: 30000,
-          });
-          break; // Lock acquired
-        } catch (lockErr) {
-          if (lockErr.code === 'ELOCKED' && attempt < maxAttempts - 1) {
-            // Wait and retry
-            const waitMs = retryDelayMs + Math.random() * retryDelayMs;
-            const start = Date.now();
-            while (Date.now() - start < waitMs) {
-              /* spin wait */
-            }
-            continue;
-          }
-          throw lockErr;
-        }
-      }
+      // Acquire lock with async API (proper retries without CPU spin-wait)
+      release = await lockfile.lock(clustersFile, {
+        lockfilePath,
+        stale: 30000,
+        retries: {
+          retries: 20,
+          minTimeout: 100,
+          maxTimeout: 200,
+          randomize: true,
+        },
+      });
 
       const data = JSON.parse(fs.readFileSync(clustersFile, 'utf8'));
       const clusterIds = Object.keys(data);
@@ -209,7 +209,7 @@ class Orchestrator {
       console.error(error.stack);
     } finally {
       if (release) {
-        release();
+        await release();
       }
     }
   }
@@ -345,7 +345,7 @@ class Orchestrator {
    * Uses file locking to prevent race conditions with other processes
    * @private
    */
-  _saveClusters() {
+  async _saveClusters() {
     // Skip saving if orchestrator is closed (prevents race conditions during cleanup)
     if (this.closed) {
       return;
@@ -356,30 +356,17 @@ class Orchestrator {
     let release;
 
     try {
-      // Acquire exclusive lock (sync API doesn't support retries, so we retry manually)
-      const maxAttempts = 50;
-      const retryDelayMs = 100;
-
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        try {
-          release = lockfile.lockSync(clustersFile, {
-            lockfilePath,
-            stale: 30000, // Lock expires after 30s (in case process dies)
-          });
-          break; // Lock acquired
-        } catch (lockErr) {
-          if (lockErr.code === 'ELOCKED' && attempt < maxAttempts - 1) {
-            // Wait and retry with jitter
-            const waitMs = retryDelayMs + Math.random() * retryDelayMs * 2;
-            const start = Date.now();
-            while (Date.now() - start < waitMs) {
-              /* spin wait */
-            }
-            continue;
-          }
-          throw lockErr;
-        }
-      }
+      // Acquire exclusive lock with async API (proper retries without CPU spin-wait)
+      release = await lockfile.lock(clustersFile, {
+        lockfilePath,
+        stale: 30000,
+        retries: {
+          retries: 50,
+          minTimeout: 100,
+          maxTimeout: 300,
+          randomize: true,
+        },
+      });
 
       // Read existing clusters from file (other processes may have added clusters)
       let existingClusters = {};
@@ -456,7 +443,7 @@ class Orchestrator {
     } finally {
       // Always release lock
       if (release) {
-        release();
+        await release();
       }
     }
   }
@@ -882,12 +869,12 @@ class Orchestrator {
       });
 
       // Watch for AGENT_ERROR - if critical agent fails, stop cluster
-      subscribeToClusterTopic('AGENT_ERROR', (message) => {
+      subscribeToClusterTopic('AGENT_ERROR', async (message) => {
         const agentRole = message.content?.data?.role;
         const attempts = message.content?.data?.attempts || 1;
 
         // Save cluster state to persist failureInfo
-        this._saveClusters();
+        await await this._saveClusters();
 
         // Only stop cluster if non-validator agent exhausted retries
         if (agentRole === 'implementation' && attempts >= 3) {
@@ -907,7 +894,7 @@ class Orchestrator {
       });
 
       // Persist agent state changes for accurate status display
-      messageBus.on('topic:AGENT_LIFECYCLE', (message) => {
+      messageBus.on('topic:AGENT_LIFECYCLE', async (message) => {
         const event = message.content?.data?.event;
         // Save on key state transitions that affect status display
         if (
@@ -919,7 +906,7 @@ class Orchestrator {
             'STARTED',
           ].includes(event)
         ) {
-          this._saveClusters();
+          await await this._saveClusters();
         }
       });
 
@@ -1050,7 +1037,7 @@ class Orchestrator {
       // ^^^^^^ REMOVED - clusters run until explicitly stopped or completed
 
       // Save cluster to disk
-      this._saveClusters();
+      await this._saveClusters();
 
       return {
         id: clusterId,
@@ -1121,7 +1108,7 @@ class Orchestrator {
     this._log(`Cluster ${clusterId} stopped`);
 
     // Save updated state
-    this._saveClusters();
+    await this._saveClusters();
   }
 
   /**
@@ -1169,7 +1156,7 @@ class Orchestrator {
     this._log(`Cluster ${clusterId} killed`);
 
     // Save updated state (will be marked as 'killed' in file)
-    this._saveClusters();
+    await this._saveClusters();
 
     // Now remove from memory after persisting
     this.clusters.delete(clusterId);
@@ -1394,7 +1381,7 @@ class Orchestrator {
       cluster.failureInfo = null;
 
       // Save updated state
-      this._saveClusters();
+      await this._saveClusters();
 
       // Resume the failed agent
       failedAgent.resume(context).catch((err) => {
@@ -1515,7 +1502,7 @@ class Orchestrator {
     }
 
     // Save updated state
-    this._saveClusters();
+    await this._saveClusters();
 
     this._log(`[Orchestrator] Cluster ${clusterId} resumed`);
 
@@ -1765,7 +1752,7 @@ Continue from where you left off. Review your previous output to understand what
     });
 
     // Save updated cluster state to disk
-    this._saveClusters();
+    await this._saveClusters();
   }
 
   /**

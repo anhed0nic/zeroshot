@@ -3,30 +3,16 @@ import { TASKS_DIR, TASKS_FILE, LOGS_DIR, SCHEDULES_FILE } from './config.js';
 import { generateName } from './name-generator.js';
 import lockfile from 'proper-lockfile';
 
-// Lock options for sync API (no retries allowed)
+// Lock options with async retry support
 const LOCK_OPTIONS = {
   stale: 30000, // Consider lock stale after 30s
+  retries: {
+    retries: 100,
+    minTimeout: 100,
+    maxTimeout: 200,
+    randomize: true,
+  },
 };
-
-// Retry wrapper for sync lock acquisition
-function lockWithRetry(file, options, maxRetries = 100, delayMs = 100) {
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      return lockfile.lockSync(file, options);
-    } catch (err) {
-      if (err.code === 'ELOCKED' && i < maxRetries - 1) {
-        // File is locked, wait and retry
-        const start = Date.now();
-        while (Date.now() - start < delayMs) {
-          // Busy wait (sync)
-        }
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw new Error(`Failed to acquire lock after ${maxRetries} retries`);
-}
 
 export function ensureDirs() {
   if (!existsSync(TASKS_DIR)) mkdirSync(TASKS_DIR, { recursive: true });
@@ -60,9 +46,9 @@ export function saveTasks(tasks) {
 /**
  * Atomic read-modify-write with file locking
  * @param {Function} modifier - Function that receives tasks object and returns modified tasks
- * @returns {any} - Return value from modifier function
+ * @returns {Promise<any>} - Return value from modifier function
  */
-export function withTasksLock(modifier) {
+export async function withTasksLock(modifier) {
   ensureDirs();
 
   // Create file if it doesn't exist (needed for locking)
@@ -72,8 +58,8 @@ export function withTasksLock(modifier) {
 
   let release;
   try {
-    // Acquire lock (blocks until available)
-    release = lockWithRetry(TASKS_FILE, LOCK_OPTIONS);
+    // Acquire lock with async API (proper retries without CPU spin-wait)
+    release = await lockfile.lock(TASKS_FILE, LOCK_OPTIONS);
 
     // Read current state
     const content = readFileSync(TASKS_FILE, 'utf-8');
@@ -93,7 +79,7 @@ export function withTasksLock(modifier) {
     return result;
   } finally {
     if (release) {
-      release();
+      await release();
     }
   }
 }
@@ -122,8 +108,8 @@ export function addTask(task) {
   });
 }
 
-export function removeTask(id) {
-  withTasksLock((tasks) => {
+export async function removeTask(id) {
+  await withTasksLock((tasks) => {
     delete tasks[id];
   });
 }
@@ -138,7 +124,7 @@ export function generateScheduleId() {
 
 // Schedule management - same pattern with locking
 
-function withSchedulesLock(modifier) {
+async function withSchedulesLock(modifier) {
   ensureDirs();
 
   if (!existsSync(SCHEDULES_FILE)) {
@@ -147,7 +133,8 @@ function withSchedulesLock(modifier) {
 
   let release;
   try {
-    release = lockWithRetry(SCHEDULES_FILE, LOCK_OPTIONS);
+    // Acquire lock with async API (proper retries without CPU spin-wait)
+    release = await lockfile.lock(SCHEDULES_FILE, LOCK_OPTIONS);
 
     const content = readFileSync(SCHEDULES_FILE, 'utf-8');
     let schedules;
@@ -163,7 +150,7 @@ function withSchedulesLock(modifier) {
     return result;
   } finally {
     if (release) {
-      release();
+      await release();
     }
   }
 }
@@ -210,8 +197,8 @@ export function updateSchedule(id, updates) {
   });
 }
 
-export function removeSchedule(id) {
-  withSchedulesLock((schedules) => {
+export async function removeSchedule(id) {
+  await withSchedulesLock((schedules) => {
     delete schedules[id];
   });
 }
