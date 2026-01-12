@@ -174,8 +174,8 @@ describe('Config Validator', function () {
       assert.ok(!result.errors.some((e) => e.includes('catch-all')));
     });
 
-    it('should reject invalid model name', function () {
-      const result = validateBasicStructure({
+    it('should warn on invalid model name', function () {
+      const result = validateConfig({
         agents: [
           {
             id: 'worker',
@@ -185,7 +185,7 @@ describe('Config Validator', function () {
           },
         ],
       });
-      assert.ok(result.errors.some((e) => e.includes("must be 'opus', 'sonnet', or 'haiku'")));
+      assert.ok(result.warnings.some((w) => w.includes('model "gpt4"') && w.includes('claude')));
     });
   });
 
@@ -1336,7 +1336,10 @@ describe('Config Validator', function () {
     // Test 3: Multiple agents, one invalid
     it('should only error for invalid agent', function () {
       const config = {
-        agents: [createAgent('valid-worker', ['a'], ['a']), createAgent('invalid-worker', ['b'], ['nonexistent'])],
+        agents: [
+          createAgent('valid-worker', ['a'], ['a']),
+          createAgent('invalid-worker', ['b'], ['nonexistent']),
+        ],
       };
       const result = validateTemplateVariables(config);
       assert.strictEqual(result.errors.length, 1);
@@ -1523,11 +1526,7 @@ describe('Config Validator', function () {
       const templateErrors = result.errors.filter(
         (e) => e.includes('{{result.') || e.includes('not defined in jsonSchema')
       );
-      assert.strictEqual(
-        templateErrors.length,
-        0,
-        `Template errors: ${templateErrors.join(', ')}`
-      );
+      assert.strictEqual(templateErrors.length, 0, `Template errors: ${templateErrors.join(', ')}`);
     });
 
     // Test 4: Real config: conductor-bootstrap.json (if exists)
@@ -1552,11 +1551,7 @@ describe('Config Validator', function () {
       const templateErrors = result.errors.filter(
         (e) => e.includes('{{result.') || e.includes('not defined in jsonSchema')
       );
-      assert.strictEqual(
-        templateErrors.length,
-        0,
-        `Template errors: ${templateErrors.join(', ')}`
-      );
+      assert.strictEqual(templateErrors.length, 0, `Template errors: ${templateErrors.join(', ')}`);
     });
 
     // Test 5: Non-JSON agents pass without template validation
@@ -2687,6 +2682,48 @@ describe('Config Validator', function () {
         const roleErrors = result.errors.filter((e) => e.includes('[Gap 15]'));
         assert.strictEqual(roleErrors.length, 0);
       });
+
+      it('should pass when logic has zero-length fallback (git-pusher pattern)', function () {
+        // This tests the git-pusher agent pattern that checks validators.length === 0
+        // and returns early if no validators exist (valid TRIVIAL/SIMPLE workflow)
+        const config = {
+          agents: [
+            {
+              id: 'git-pusher',
+              role: 'completion-detector',
+              triggers: [
+                {
+                  topic: 'VALIDATION_RESULT',
+                  logic: {
+                    // This is the exact pattern from git-pusher-agent.json
+                    // It correctly handles zero validators with an early return
+                    script:
+                      "const validators = cluster.getAgentsByRole('validator'); if (validators.length === 0) return true; return validators.length > 0;",
+                  },
+                },
+              ],
+              hooks: {
+                onComplete: {
+                  action: 'publish_message',
+                  config: { topic: 'PR_CREATED', content: {} },
+                },
+              },
+            },
+            {
+              id: 'completion',
+              role: 'orchestrator',
+              triggers: [{ topic: 'PR_CREATED', action: 'stop_cluster' }],
+            },
+          ],
+        };
+        const result = validateConfig(config);
+        const roleErrors = result.errors.filter((e) => e.includes('[Gap 15]'));
+        assert.strictEqual(
+          roleErrors.length,
+          0,
+          'Should not error when logic has zero-length fallback pattern'
+        );
+      });
     });
   });
 
@@ -2717,6 +2754,106 @@ describe('Config Validator', function () {
       const result = validateConfig(config);
       // Should pass all phases including new semantic validation
       assert.strictEqual(result.valid, true);
+    });
+  });
+
+  // === PROVIDER-AGNOSTIC MODEL VALIDATION ===
+  // Prevents hardcoding provider-specific model names (haiku/sonnet/opus/gpt-4/gemini)
+  // which break when switching providers. Use modelLevel: level1/level2/level3 instead.
+
+  describe('Provider-agnostic model validation', function () {
+    it('should ERROR when agent uses direct model field', function () {
+      const result = validateConfig({
+        agents: [
+          {
+            id: 'worker',
+            role: 'impl',
+            model: 'haiku', // FORBIDDEN - must use modelLevel
+            triggers: [{ topic: 'START' }],
+          },
+        ],
+      });
+      assert.ok(
+        result.errors.some((e) => e.includes("uses 'model:")),
+        'Expected error about direct model usage. Errors: ' + JSON.stringify(result.errors)
+      );
+    });
+
+    it('should ERROR for ANY direct model value, not just known names', function () {
+      const result = validateConfig({
+        agents: [
+          {
+            id: 'worker',
+            role: 'impl',
+            model: 'some-random-model-name',
+            triggers: [{ topic: 'START' }],
+          },
+        ],
+      });
+      assert.ok(
+        result.errors.some((e) => e.includes("uses 'model:")),
+        'Expected error about direct model usage. Errors: ' + JSON.stringify(result.errors)
+      );
+    });
+
+    it('should ALLOW modelLevel field', function () {
+      const result = validateConfig({
+        agents: [
+          {
+            id: 'worker',
+            role: 'impl',
+            modelLevel: 'level1', // ALLOWED
+            triggers: [{ topic: 'START' }],
+            hooks: {
+              onComplete: {
+                action: 'publish_message',
+                config: { topic: 'DONE', content: {} },
+              },
+            },
+          },
+          {
+            id: 'orch',
+            role: 'orchestrator',
+            triggers: [{ topic: 'DONE', action: 'stop_cluster' }],
+          },
+        ],
+      });
+      assert.ok(
+        !result.errors.some((e) => e.includes('model')),
+        'Should not error on modelLevel. Errors: ' + JSON.stringify(result.errors)
+      );
+    });
+
+    it('should ALLOW modelRules with model inside rules (iteration-based selection)', function () {
+      const result = validateConfig({
+        agents: [
+          {
+            id: 'worker',
+            role: 'impl',
+            triggers: [{ topic: 'START' }],
+            modelRules: [
+              { iterations: '1-3', model: 'sonnet' },
+              { iterations: 'all', model: 'haiku' },
+            ],
+            hooks: {
+              onComplete: {
+                action: 'publish_message',
+                config: { topic: 'DONE', content: {} },
+              },
+            },
+          },
+          {
+            id: 'orch',
+            role: 'orchestrator',
+            triggers: [{ topic: 'DONE', action: 'stop_cluster' }],
+          },
+        ],
+      });
+      // modelRules is allowed because it's a different system (iteration-based)
+      assert.ok(
+        !result.errors.some((e) => e.includes("uses 'model:")),
+        'modelRules should be allowed. Errors: ' + JSON.stringify(result.errors)
+      );
     });
   });
 });

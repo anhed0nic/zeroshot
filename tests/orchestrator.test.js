@@ -16,6 +16,12 @@ const Orchestrator = require('../src/orchestrator.js');
 const MockTaskRunner = require('./helpers/mock-task-runner.js');
 const LedgerAssertions = require('./helpers/ledger-assertions.js');
 
+// Isolate tests from user settings (prevents minModel/maxModel conflicts)
+const testSettingsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zeroshot-test-settings-'));
+const testSettingsFile = path.join(testSettingsDir, 'settings.json');
+fs.writeFileSync(testSettingsFile, JSON.stringify({ maxModel: 'opus', minModel: null }));
+process.env.ZEROSHOT_SETTINGS_FILE = testSettingsFile;
+
 // Test utilities
 function createTempDir() {
   const tmpBase = path.join(os.tmpdir(), 'zeroshot-test');
@@ -49,7 +55,7 @@ function createSimpleConfig() {
       {
         id: 'worker',
         role: 'implementation',
-        model: 'sonnet',
+        modelLevel: 'level2',
         outputFormat: 'text',
         triggers: [
           {
@@ -78,7 +84,7 @@ function _createMultiAgentConfig() {
       {
         id: 'agent1',
         role: 'implementation',
-        model: 'sonnet',
+        modelLevel: 'level2',
         outputFormat: 'text',
         triggers: [{ topic: 'ISSUE_OPENED', action: 'execute_task' }],
         prompt: 'Agent 1',
@@ -86,7 +92,7 @@ function _createMultiAgentConfig() {
       {
         id: 'agent2',
         role: 'validator',
-        model: 'sonnet',
+        modelLevel: 'level2',
         outputFormat: 'text',
         triggers: [{ topic: 'IMPLEMENTATION_READY', action: 'execute_task' }],
         prompt: 'Agent 2',
@@ -102,7 +108,7 @@ function _createValidatorConfig() {
       {
         id: 'worker',
         role: 'implementation',
-        model: 'sonnet',
+        modelLevel: 'level2',
         outputFormat: 'text',
         triggers: [{ topic: 'ISSUE_OPENED', action: 'execute_task' }],
         prompt: 'Worker',
@@ -116,7 +122,7 @@ function _createValidatorConfig() {
       {
         id: 'validator',
         role: 'validator',
-        model: 'sonnet',
+        modelLevel: 'level2',
         outputFormat: 'json',
         jsonSchema: {
           type: 'object',
@@ -183,7 +189,11 @@ describe('Orchestrator - Cluster Lifecycle (CRITICAL)', function () {
 
       // The orchestrator doesn't validate config structure upfront
       // It will fail when trying to start agents, but cluster is created
-      const result = await orchestrator._startInternal(badConfig, { text: 'Task' }, { testMode: true });
+      const result = await orchestrator._startInternal(
+        badConfig,
+        { text: 'Task' },
+        { testMode: true }
+      );
 
       // Cluster is created even with empty agents
       assert.ok(result.id, 'Cluster ID should be generated');
@@ -203,14 +213,14 @@ describe('Orchestrator - Cluster Lifecycle (CRITICAL)', function () {
       );
     });
 
-    it('should handle missing input (requires issue or text)', async function () {
+    it('should handle missing input (requires issue, file, or text)', async function () {
       const config = createSimpleConfig();
 
       await assert.rejects(
         async () => {
           await orchestrator.start(config, {});
         },
-        /issue or text/i,
+        /issue.*or text/i,
         'Should reject missing input'
       );
     });
@@ -246,7 +256,11 @@ describe('Orchestrator - Cluster Lifecycle (CRITICAL)', function () {
 
       const persisted = JSON.parse(fs.readFileSync(clustersFile, 'utf8'));
       assert.ok(persisted[clusterId], 'Cluster should be in clusters.json');
-      assert.strictEqual(persisted[clusterId].state, 'stopped', 'Persisted state should be stopped');
+      assert.strictEqual(
+        persisted[clusterId].state,
+        'stopped',
+        'Persisted state should be stopped'
+      );
     });
 
     it('should fail if cluster does not exist', async function () {
@@ -472,7 +486,7 @@ describe('Orchestrator - Crash Recovery (CRITICAL)', function () {
 
     // Phase 2: New orchestrator instance - auto-loads clusters
     {
-      const orchestrator2 = new Orchestrator({
+      const orchestrator2 = await Orchestrator.create({
         storageDir,
         quiet: true,
         // skipLoad: false (default) - should auto-load
@@ -631,16 +645,17 @@ describe('Orchestrator - Concurrent Operations (Race Conditions)', function () {
     orchestrator.close();
 
     // Create multiple orchestrators that all try to load at once
-    const orchestrators = Array(5)
-      .fill()
-      .map(
-        () =>
-          new Orchestrator({
+    const orchestrators = await Promise.all(
+      Array(5)
+        .fill()
+        .map(() =>
+          Orchestrator.create({
             storageDir,
             quiet: true,
             // skipLoad: false (default) - all load simultaneously
           })
-      );
+        )
+    );
 
     // Verify: All loaded the cluster successfully
     for (const orch of orchestrators) {
@@ -705,8 +720,10 @@ describe('Orchestrator - Error Handling', function () {
 
     // Cluster should still exist and not have crashed (state can be running, stopping, or stopped)
     assert.ok(cluster, 'Cluster should still exist');
-    assert.ok(['running', 'stopping', 'stopped'].includes(cluster.state),
-      `Cluster should be in valid state (got: ${cluster.state})`);
+    assert.ok(
+      ['running', 'stopping', 'stopped'].includes(cluster.state),
+      `Cluster should be in valid state (got: ${cluster.state})`
+    );
   });
 
   it('should handle missing storageDir gracefully', function () {
@@ -821,7 +838,7 @@ describe('Orchestrator - File Locking', function () {
     }
 
     // Load clusters (should acquire lock)
-    const orch2 = new Orchestrator({
+    const orch2 = await Orchestrator.create({
       storageDir,
       quiet: true,
       // skipLoad: false (default)

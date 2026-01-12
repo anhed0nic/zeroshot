@@ -21,7 +21,6 @@ const os = require('os');
 const chalk = require('chalk');
 const Orchestrator = require('../src/orchestrator');
 const { setupCompletion } = require('../lib/completion');
-const { parseChunk } = require('../lib/stream-json-parser');
 const { formatWatchMode } = require('./message-formatters-watch');
 const {
   formatAgentLifecycle,
@@ -46,8 +45,11 @@ const {
   coerceValue,
   DEFAULT_SETTINGS,
 } = require('../lib/settings');
+const { normalizeProviderName } = require('../lib/provider-names');
+const { getProvider, parseProviderChunk } = require('../src/providers');
 const { MOUNT_PRESETS, resolveEnvs } = require('../lib/docker-config');
 const { requirePreflight } = require('../src/preflight');
+const { providersCommand, setDefaultCommand, setupCommand } = require('./commands/providers');
 // Setup wizard removed - use: zeroshot settings set <key> <value>
 const { checkForUpdates } = require('./lib/update-checker');
 const { StatusFooter, AGENT_STATE, ACTIVE_STATES } = require('../src/status-footer');
@@ -73,9 +75,7 @@ let activeStatusFooter = null;
  * @param {...any} args - Arguments to print (like console.log)
  */
 function safePrint(...args) {
-  const text = args.map(arg =>
-    typeof arg === 'string' ? arg : String(arg)
-  ).join(' ');
+  const text = args.map((arg) => (typeof arg === 'string' ? arg : String(arg))).join(' ');
 
   if (activeStatusFooter) {
     activeStatusFooter.print(text + '\n');
@@ -191,14 +191,23 @@ function parseMountSpecs(specs) {
 // Lazy-loaded orchestrator (quiet by default) - created on first use
 /** @type {import('../src/orchestrator') | null} */
 let _orchestrator = null;
+/** @type {Promise<import('../src/orchestrator')> | null} */
+let _orchestratorPromise = null;
 /**
- * @returns {import('../src/orchestrator')}
+ * @returns {Promise<import('../src/orchestrator')>}
  */
 function getOrchestrator() {
-  if (!_orchestrator) {
-    _orchestrator = new Orchestrator({ quiet: true });
+  if (_orchestrator) {
+    return Promise.resolve(_orchestrator);
   }
-  return _orchestrator;
+  // Use a promise to prevent multiple concurrent initializations
+  if (!_orchestratorPromise) {
+    _orchestratorPromise = Orchestrator.create({ quiet: true }).then((orch) => {
+      _orchestrator = orch;
+      return orch;
+    });
+  }
+  return _orchestratorPromise;
 }
 
 /**
@@ -394,7 +403,7 @@ if (shouldShowBanner) {
 
 program
   .name('zeroshot')
-  .description('Multi-agent orchestration and task management for Claude')
+  .description('Multi-agent orchestration and task management for Claude, Codex, and Gemini')
   .version(require('../package.json').version)
   .option('-q, --quiet', 'Suppress prompts (first-run wizard, update checks)')
   .addHelpText(
@@ -402,9 +411,10 @@ program
     `
 Examples:
   ${chalk.cyan('zeroshot run 123 --ship')}             Full automation: isolated + auto-merge PR
-  ${chalk.cyan('zeroshot run 123')}                    Run cluster and attach to first agent
-  ${chalk.cyan('zeroshot run 123 -d')}                 Run cluster in background (detached)
-  ${chalk.cyan('zeroshot run "Implement feature X"')}  Run cluster on plain text task
+  ${chalk.cyan('zeroshot run 123')}                    Run cluster from GitHub issue
+  ${chalk.cyan('zeroshot run feature.md')}             Run cluster from markdown file
+  ${chalk.cyan('zeroshot run "Implement feature X"')}  Run cluster from plain text
+  ${chalk.cyan('zeroshot run 123 -d')}                 Run in background (detached)
   ${chalk.cyan('zeroshot run 123 --docker')}           Run in Docker container (safe for e2e tests)
   ${chalk.cyan('zeroshot task run "Fix the bug"')}     Run single-agent background task
   ${chalk.cyan('zeroshot list')}                       List all tasks and clusters
@@ -421,6 +431,7 @@ Examples:
   ${chalk.cyan('zeroshot purge -y')}                   Purge everything without confirmation
   ${chalk.cyan('zeroshot settings')}                   Show/manage zeroshot settings (maxModel, config, etc.)
   ${chalk.cyan('zeroshot settings set <key> <val>')}   Set a setting (e.g., maxModel haiku)
+  ${chalk.cyan('zeroshot providers')}                  Show provider status and defaults
   ${chalk.cyan('zeroshot config list')}                List available cluster configs
   ${chalk.cyan('zeroshot config show <name>')}         Visualize a cluster config (agents, triggers, flow)
   ${chalk.cyan('zeroshot export <id>')}                Export cluster conversation to file
@@ -441,7 +452,7 @@ Shell completion:
 // Run command - CLUSTER with auto-detection
 program
   .command('run <input>')
-  .description('Start a multi-agent cluster (auto-detects GitHub issue or plain text)')
+  .description('Start a multi-agent cluster (GitHub issue, markdown file, or plain text)')
   .option('--config <file>', 'Path to cluster config JSON (default: conductor-bootstrap)')
   .option('--docker', 'Run cluster inside Docker container (full isolation)')
   .option('--worktree', 'Use git worktree for isolation (lightweight, no Docker required)')
@@ -453,13 +464,24 @@ program
     '--strict-schema',
     'Enforce JSON schema via CLI (no live streaming). Default: live streaming with local validation'
   )
-  .option('--pr', 'Create PR for human review (uses worktree isolation by default, use --docker for Docker)')
-  .option('--ship', 'Full automation: worktree isolation + PR + auto-merge (use --docker for Docker)')
+  .option(
+    '--pr',
+    'Create PR for human review (uses worktree isolation by default, use --docker for Docker)'
+  )
+  .option(
+    '--ship',
+    'Full automation: worktree isolation + PR + auto-merge (use --docker for Docker)'
+  )
   .option('--workers <n>', 'Max sub-agents for worker to spawn in parallel', parseInt)
+  .option('--provider <provider>', 'Override all agents to use a provider (claude, codex, gemini)')
+  .option('--model <model>', 'Override all agent models (provider-specific model id)')
   .option('-d, --detach', 'Run in background (default: attach to first agent)')
   .option('--mount <spec...>', 'Add Docker mount (host:container[:ro]). Repeatable.')
   .option('--no-mounts', 'Disable all Docker credential mounts')
-  .option('--container-home <path>', 'Container home directory for $HOME expansion (default: /root)')
+  .option(
+    '--container-home <path>',
+    'Container home directory for $HOME expansion (default: /root)'
+  )
   .addHelpText(
     'after',
     `
@@ -506,6 +528,10 @@ Input formats:
       else if (inputArg.match(/^[\w-]+\/[\w-]+#\d+$/)) {
         input.issue = inputArg;
       }
+      // Check if it's a markdown file (.md or .markdown)
+      else if (/\.(md|markdown)$/i.test(inputArg)) {
+        input.file = inputArg;
+      }
       // Otherwise, treat as plain text
       else {
         input.text = inputArg;
@@ -514,11 +540,16 @@ Input formats:
       // === PREFLIGHT CHECKS ===
       // Validate all dependencies BEFORE starting anything
       // This gives users clear, actionable error messages upfront
+      const settings = loadSettings();
+      const providerOverride = normalizeProviderName(
+        options.provider || process.env.ZEROSHOT_PROVIDER || settings.defaultProvider
+      );
       const preflightOptions = {
         requireGh: !!input.issue, // gh CLI required when fetching GitHub issues
         requireDocker: options.docker, // Docker required for --docker mode
         requireGit: options.worktree, // Git required for worktree isolation
         quiet: process.env.ZEROSHOT_DAEMON === '1', // Suppress success in daemon mode
+        provider: providerOverride,
       };
       requirePreflight(preflightOptions);
 
@@ -570,6 +601,8 @@ Input formats:
             ZEROSHOT_PR: options.pr ? '1' : '',
             ZEROSHOT_WORKTREE: options.worktree ? '1' : '',
             ZEROSHOT_WORKERS: options.workers?.toString() || '',
+            ZEROSHOT_MODEL: options.model || '',
+            ZEROSHOT_PROVIDER: options.provider || '',
             ZEROSHOT_CWD: targetCwd, // Explicit CWD for orchestrator
           },
         });
@@ -580,8 +613,6 @@ Input formats:
       }
 
       // === FOREGROUND MODE (default) or DAEMON CHILD ===
-      // Load user settings
-      const settings = loadSettings();
 
       // Use cluster ID from env (daemon mode) or generate new one (foreground mode)
       // IMPORTANT: Set env var so orchestrator picks it up
@@ -610,8 +641,23 @@ Input formats:
       }
 
       // Create orchestrator with clusterId override for foreground mode
-      const orchestrator = getOrchestrator();
+      const orchestrator = await getOrchestrator();
       config = orchestrator.loadConfig(configPath);
+
+      if (!config.defaultProvider) {
+        config.defaultProvider = settings.defaultProvider || 'claude';
+      }
+      config.defaultProvider = normalizeProviderName(config.defaultProvider) || 'claude';
+
+      if (providerOverride) {
+        const provider = getProvider(providerOverride);
+        const providerSettings = settings.providerSettings?.[providerOverride] || {};
+        config.forceProvider = providerOverride;
+        config.defaultProvider = providerOverride;
+        config.forceLevel = providerSettings.defaultLevel || provider.getDefaultLevel();
+        config.defaultLevel = config.forceLevel;
+        console.log(chalk.dim(`Provider override: ${providerOverride} (all agents)`));
+      }
 
       // Track for global error handler cleanup
       activeClusterId = clusterId;
@@ -639,19 +685,59 @@ Input formats:
         }
       }
 
+      // Apply model override to all agents (CLI > env)
+      const modelOverride = options.model || process.env.ZEROSHOT_MODEL;
+      if (modelOverride) {
+        const providerName = normalizeProviderName(
+          providerOverride || config.defaultProvider || settings.defaultProvider || 'claude'
+        );
+        const provider = getProvider(providerName);
+        const catalog = provider.getModelCatalog();
+
+        if (catalog && !catalog[modelOverride]) {
+          console.warn(
+            chalk.yellow(
+              `Warning: model override "${modelOverride}" is not in the ${providerName} catalog`
+            )
+          );
+        }
+
+        if (providerName === 'claude' && ['opus', 'sonnet', 'haiku'].includes(modelOverride)) {
+          const { validateModelAgainstMax } = require('../lib/settings');
+          try {
+            validateModelAgainstMax(modelOverride, settings.maxModel);
+          } catch (err) {
+            console.error(chalk.red(`Error: ${err.message}`));
+            process.exit(1);
+          }
+        }
+
+        // Override all agent models
+        for (const agent of config.agents) {
+          agent.model = modelOverride;
+          if (agent.modelRules) {
+            delete agent.modelRules;
+          }
+        }
+        console.log(chalk.dim(`Model override: ${modelOverride} (all agents)`));
+      }
+
       // Build start options (CLI flags > env vars > settings)
       // In foreground mode, use CLI options directly; in daemon mode, use env vars
       // CRITICAL: cwd must be passed to orchestrator for agent CWD propagation
       const targetCwd = process.env.ZEROSHOT_CWD || detectGitRepoRoot();
       const startOptions = {
+        clusterId,
         cwd: targetCwd, // Target working directory for agents
-        isolation:
-          options.docker || process.env.ZEROSHOT_DOCKER === '1' || settings.defaultDocker,
+        isolation: options.docker || process.env.ZEROSHOT_DOCKER === '1' || settings.defaultDocker,
         isolationImage: options.dockerImage || process.env.ZEROSHOT_DOCKER_IMAGE || undefined,
         worktree: options.worktree || process.env.ZEROSHOT_WORKTREE === '1',
         autoPr: options.pr || process.env.ZEROSHOT_PR === '1',
         autoMerge: process.env.ZEROSHOT_MERGE === '1',
         autoPush: process.env.ZEROSHOT_PUSH === '1',
+        // Model override (for dynamically added agents)
+        modelOverride: modelOverride || undefined,
+        providerOverride: providerOverride || undefined,
         // Docker mount options
         noMounts: options.noMounts || false,
         mounts: options.mount ? parseMountSpecs(options.mount) : undefined,
@@ -850,8 +936,12 @@ taskCmd
   .command('run <prompt>')
   .description('Run a single-agent background task')
   .option('-C, --cwd <path>', 'Working directory for task')
-  .option('-r, --resume <sessionId>', 'Resume a specific Claude session')
-  .option('-c, --continue', 'Continue the most recent session')
+  .option('--provider <provider>', 'Provider to use (claude, codex, gemini)')
+  .option('--model <model>', 'Model id override for the provider')
+  .option('--model-level <level>', 'Model level override (level1, level2, level3)')
+  .option('--reasoning-effort <effort>', 'Reasoning effort (low, medium, high, xhigh)')
+  .option('-r, --resume <sessionId>', 'Resume a specific Claude session (claude only)')
+  .option('-c, --continue', 'Continue the most recent Claude session (claude only)')
   .option(
     '-o, --output-format <format>',
     'Output format: stream-json (default), text, json',
@@ -862,11 +952,16 @@ taskCmd
   .action(async (prompt, options) => {
     try {
       // === PREFLIGHT CHECKS ===
-      // Claude CLI must be installed and authenticated for task execution
+      // Provider CLI must be installed for task execution
+      const settings = loadSettings();
+      const providerOverride = normalizeProviderName(
+        options.provider || process.env.ZEROSHOT_PROVIDER || settings.defaultProvider
+      );
       requirePreflight({
         requireGh: false, // gh not needed for plain tasks
         requireDocker: false, // Docker not needed for plain tasks
         quiet: false,
+        provider: providerOverride,
       });
 
       // Dynamically import task command (ESM module)
@@ -925,8 +1020,8 @@ program
   .action(async (options) => {
     try {
       // Get clusters
-      const clusters = getOrchestrator().listClusters();
-      const orchestrator = getOrchestrator();
+      const clusters = (await getOrchestrator()).listClusters();
+      const orchestrator = await getOrchestrator();
 
       // Enrich clusters with token data
       const enrichedClusters = clusters.map((cluster) => {
@@ -992,7 +1087,8 @@ program
         for (const cluster of enrichedClusters) {
           const created = new Date(cluster.createdAt).toLocaleString();
           const tokenDisplay = cluster.totalTokens > 0 ? cluster.totalTokens.toLocaleString() : '-';
-          const costDisplay = cluster.totalCostUsd > 0 ? '$' + cluster.totalCostUsd.toFixed(3) : '-';
+          const costDisplay =
+            cluster.totalCostUsd > 0 ? '$' + cluster.totalCostUsd.toFixed(3) : '-';
 
           // Highlight zombie clusters in red
           const stateDisplay =
@@ -1042,12 +1138,12 @@ program
 
       if (type === 'cluster') {
         // Show cluster status
-        const status = getOrchestrator().getStatus(id);
+        const status = (await getOrchestrator()).getStatus(id);
 
         // Get token usage
         let tokensByRole = null;
         try {
-          const cluster = getOrchestrator().getCluster(id);
+          const cluster = (await getOrchestrator()).getCluster(id);
           if (cluster?.messageBus) {
             tokensByRole = cluster.messageBus.getTokensByRole(id);
           }
@@ -1186,7 +1282,7 @@ program
 
       // === CLUSTER LOGS ===
       const limit = parseInt(options.limit);
-      const quietOrchestrator = new Orchestrator({ quiet: true });
+      const quietOrchestrator = await Orchestrator.create({ quiet: true });
 
       // No ID: show/follow ALL clusters
       if (!id) {
@@ -1597,7 +1693,7 @@ program
   .action(async (clusterId) => {
     try {
       console.log(`Stopping cluster ${clusterId}...`);
-      await getOrchestrator().stop(clusterId);
+      await (await getOrchestrator()).stop(clusterId);
       console.log('Cluster stopped successfully');
     } catch (error) {
       console.error('Error stopping cluster:', error.message);
@@ -1621,7 +1717,7 @@ program
 
       if (type === 'cluster') {
         console.log(`Killing cluster ${id}...`);
-        await getOrchestrator().kill(id);
+        await (await getOrchestrator()).kill(id);
         console.log('Cluster killed successfully');
       } else {
         // Kill task
@@ -1749,15 +1845,13 @@ Key bindings:
 
         // Create orchestrator instance to query agent states
         // This loads the cluster from disk including its ledger and agents
-        const orchestrator = new Orchestrator({ quiet: true });
+        const orchestrator = await Orchestrator.create({ quiet: true });
 
         try {
           const status = orchestrator.getStatus(id);
           // Agent is "active" if in any working state
           // Note: currentTaskId may be null briefly between TASK_STARTED and TASK_ID_ASSIGNED
-          const activeAgents = status.agents.filter(
-            (a) => ACTIVE_STATES.has(a.state)
-          );
+          const activeAgents = status.agents.filter((a) => ACTIVE_STATES.has(a.state));
 
           if (activeAgents.length === 0) {
             console.error(chalk.yellow(`No agents currently executing tasks in cluster ${id}`));
@@ -1808,10 +1902,16 @@ Key bindings:
           if (!agent.currentTaskId) {
             if (ACTIVE_STATES.has(agent.state)) {
               // Agent is working but task ID not yet assigned
-              console.error(chalk.yellow(`Agent '${options.agent}' is working (state: ${agent.state}, task ID not yet assigned)`));
+              console.error(
+                chalk.yellow(
+                  `Agent '${options.agent}' is working (state: ${agent.state}, task ID not yet assigned)`
+                )
+              );
               console.log(chalk.dim('Try again in a moment...'));
             } else {
-              console.error(chalk.yellow(`Agent '${options.agent}' is not currently running a task`));
+              console.error(
+                chalk.yellow(`Agent '${options.agent}' is not currently running a task`)
+              );
               console.log(chalk.dim(`State: ${agent.state}`));
             }
             return;
@@ -1917,7 +2017,7 @@ program
   .action(async (options) => {
     try {
       // Get counts first
-      const orchestrator = getOrchestrator();
+      const orchestrator = await getOrchestrator();
       const clusters = orchestrator.listClusters();
       const runningClusters = clusters.filter(
         (c) => c.state === 'running' || c.state === 'initializing'
@@ -2148,17 +2248,24 @@ program
       // Check if cluster exists
       const cluster = orchestrator.getCluster(id);
 
-      // === PREFLIGHT CHECKS ===
-      // Claude CLI must be installed and authenticated
-      // Check if cluster uses isolation (needs Docker)
-      const requiresDocker = cluster?.isolation?.enabled || false;
-      requirePreflight({
-        requireGh: false, // Resume doesn't fetch new issues
-        requireDocker: requiresDocker,
-        quiet: false,
-      });
+      const settings = loadSettings();
 
       if (cluster) {
+        // === PREFLIGHT CHECKS ===
+        // Provider CLI must be installed; Docker needed if isolation was used
+        const requiresDocker = cluster?.isolation?.enabled || false;
+        const providerName =
+          cluster.config?.forceProvider ||
+          cluster.config?.defaultProvider ||
+          settings.defaultProvider;
+
+        requirePreflight({
+          requireGh: false, // Resume doesn't fetch new issues
+          requireDocker: requiresDocker,
+          quiet: false,
+          provider: providerName,
+        });
+
         // Resume cluster
         console.log(chalk.cyan(`Resuming cluster ${id}...`));
         const result = await orchestrator.resume(id, prompt);
@@ -2273,6 +2380,24 @@ program
 
         console.log(chalk.dim(`\nCluster ${id} completed.`));
       } else {
+        let providerName = settings.defaultProvider;
+        try {
+          const { getTask } = await import('../task-lib/store.js');
+          const task = getTask(id);
+          if (task?.provider) {
+            providerName = task.provider;
+          }
+        } catch {
+          // If task store is unavailable, fall back to default provider
+        }
+
+        requirePreflight({
+          requireGh: false,
+          requireDocker: false,
+          quiet: false,
+          provider: providerName,
+        });
+
         // Try resuming as task
         const { resumeTask } = await import('../task-lib/commands/resume.js');
         await resumeTask(id, prompt);
@@ -2525,7 +2650,7 @@ program
   .option('-y, --yes', 'Skip confirmation')
   .action(async (options) => {
     try {
-      const orchestrator = getOrchestrator();
+      const orchestrator = await getOrchestrator();
 
       // Get counts first
       const clusters = orchestrator.listClusters();
@@ -2751,7 +2876,7 @@ program
     try {
       const TUI = require('../src/tui');
       const tui = new TUI({
-        orchestrator: getOrchestrator(),
+        orchestrator: await getOrchestrator(),
         refreshRate: parseInt(options.refreshRate, 10),
       });
       await tui.start();
@@ -2866,7 +2991,11 @@ function formatSettingsList(settings, showUsage = false) {
     console.log(chalk.dim('  zeroshot settings set dockerMounts \'["gh","git","ssh","aws"]\''));
     console.log(chalk.dim('  zeroshot settings set dockerEnvPassthrough \'["AWS_*","TF_VAR_*"]\''));
     console.log('');
-    console.log(chalk.dim('Available mount presets: gh, git, ssh, aws, azure, kube, terraform, gcloud'));
+    console.log(
+      chalk.dim(
+        'Available mount presets: gh, git, ssh, aws, azure, kube, terraform, gcloud, claude, codex, gemini'
+      )
+    );
     console.log('');
   }
 }
@@ -2959,6 +3088,26 @@ settingsCmd.action(() => {
   const settings = loadSettings();
   formatSettingsList(settings, true);
 });
+
+// Providers management
+const providersCmd = program.command('providers').description('Manage AI providers');
+providersCmd.action(async () => {
+  await providersCommand();
+});
+
+providersCmd
+  .command('set-default <provider>')
+  .description('Set default provider (claude, codex, gemini)')
+  .action(async (provider) => {
+    await setDefaultCommand([provider]);
+  });
+
+providersCmd
+  .command('setup <provider>')
+  .description('Configure provider model levels and overrides')
+  .action(async (provider) => {
+    await setupCommand([provider]);
+  });
 
 // Update command
 program
@@ -3882,7 +4031,10 @@ function renderMessagesToTerminal(clusterId, messages) {
       const content = msg.content?.data?.line || msg.content?.data?.chunk || msg.content?.text;
       if (!content || !content.trim()) continue;
 
-      const events = parseChunk(content);
+      const provider = normalizeProviderName(
+        msg.content?.data?.provider || msg.sender_provider || 'claude'
+      );
+      const events = parseProviderChunk(provider, content);
       for (const event of events) {
         switch (event.type) {
           case 'text':
@@ -4181,7 +4333,7 @@ const FILTERED_PATTERNS = [
   /^--- Following log/,
   /--- Following logs/,
   /Ctrl\+C to stop/,
-  /^=== Claude Task:/,
+  /^=== (Claude|Codex|Gemini) Task:/,
   /^Started:/,
   /^Finished:/,
   /^Exit code:/,
@@ -4276,7 +4428,10 @@ function printMessage(msg, showClusterId = false, watchMode = false, isActive = 
     if (!content || !content.trim()) return;
 
     // Parse streaming JSON events using the parser
-    const events = parseChunk(content);
+    const provider = normalizeProviderName(
+      msg.content?.data?.provider || msg.sender_provider || 'claude'
+    );
+    const events = parseProviderChunk(provider, content);
 
     for (const event of events) {
       switch (event.type) {
@@ -4431,9 +4586,7 @@ function printMessage(msg, showClusterId = false, watchMode = false, isActive = 
 
   // IMPLEMENTATION_READY: milestone marker
   if (msg.topic === 'IMPLEMENTATION_READY') {
-    safePrint(
-      `${prefix} ${chalk.gray(timestamp)} ${chalk.bold.yellow('✅ IMPLEMENTATION READY')}`
-    );
+    safePrint(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.yellow('✅ IMPLEMENTATION READY')}`);
     if (msg.content?.data?.commit) {
       safePrint(
         `${prefix} ${chalk.gray('Commit:')} ${chalk.cyan(msg.content.data.commit.substring(0, 8))}`
@@ -4487,7 +4640,10 @@ function printMessage(msg, showClusterId = false, watchMode = false, isActive = 
 
 // Main async entry point
 async function main() {
-  const isQuiet = process.argv.includes('-q') || process.argv.includes('--quiet') || process.env.NODE_ENV === 'test';
+  const isQuiet =
+    process.argv.includes('-q') ||
+    process.argv.includes('--quiet') ||
+    process.env.NODE_ENV === 'test';
 
   // Check for updates (non-blocking if offline)
   await checkForUpdates({ quiet: isQuiet });

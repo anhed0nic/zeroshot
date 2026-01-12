@@ -11,6 +11,11 @@
  * Run at config load time to fail fast before spawning agents.
  */
 
+const { loadSettings } = require('../lib/settings');
+const { VALID_PROVIDERS, normalizeProviderName } = require('../lib/provider-names');
+const { getProvider } = require('./providers');
+const { CAPABILITIES } = require('./providers/capabilities');
+
 /**
  * Check if config is a conductor-bootstrap style config
  * Conductor configs dynamically spawn agents via CLUSTER_OPERATIONS
@@ -37,6 +42,7 @@ function isConductorConfig(config) {
 function validateConfig(config, depth = 0) {
   const errors = [];
   const warnings = [];
+  const settings = loadSettings();
 
   // Max nesting depth check
   const MAX_DEPTH = 5;
@@ -98,6 +104,11 @@ function validateConfig(config, depth = 0) {
   const configResult = validateConfigSemantics(config);
   errors.push(...configResult.errors);
   warnings.push(...configResult.warnings);
+
+  // === PHASE 10: Provider feature validation ===
+  const providerResult = validateProviderFeatures(config, settings);
+  errors.push(...providerResult.errors);
+  warnings.push(...providerResult.warnings);
 
   return {
     valid: errors.length === 0,
@@ -209,12 +220,8 @@ function validateBasicStructure(config, depth = 0) {
             );
           }
 
-          if (!rule.model) {
-            errors.push(`${rulePrefix}.model is required`);
-          } else if (!['opus', 'sonnet', 'haiku'].includes(rule.model)) {
-            errors.push(
-              `${rulePrefix}.model must be 'opus', 'sonnet', or 'haiku', got '${rule.model}'`
-            );
+          if (!rule.model && !rule.modelLevel) {
+            errors.push(`${rulePrefix}.model or modelLevel is required`);
           }
         }
 
@@ -284,12 +291,17 @@ function analyzeMessageFlow(config) {
       a.id === 'git-pusher' ||
       a.hooks?.onComplete?.config?.topic === 'CLUSTER_COMPLETE'
   );
+  const isTemplateConfig = config.params && Object.keys(config.params).length > 0;
 
   if (completionHandlers.length === 0) {
-    errors.push(
+    const message =
       'No completion handler found. Cluster will run until idle timeout (2 min). ' +
-        'Add an agent with trigger action: "stop_cluster"'
-    );
+      'Add an agent with trigger action: "stop_cluster"';
+    if (isTemplateConfig) {
+      warnings.push(`${message} (template will rely on orchestrator injection)`);
+    } else {
+      errors.push(message);
+    }
   } else if (completionHandlers.length > 1) {
     errors.push(
       `Multiple completion handlers: [${completionHandlers.map((a) => a.id).join(', ')}]. ` +
@@ -465,6 +477,15 @@ function validateAgents(config) {
       warnings.push(
         `Implementation agent '${agent.id}' has no maxIterations. ` +
           'Defaults to 30, but consider setting explicitly.'
+      );
+    }
+
+    // FORBIDDEN: Direct model specification in configs
+    // Use modelLevel (level1/level2/level3) for provider-agnostic model selection
+    if (agent.model) {
+      errors.push(
+        `Agent '${agent.id}' uses 'model: "${agent.model}"'. ` +
+          `Use 'modelLevel: "level1|level2|level3"' instead for provider-agnostic model selection.`
       );
     }
   }
@@ -1400,7 +1421,13 @@ function validateConfigSemantics(config) {
                 /allResponded/.test(script) || // Waiting for responses
                 /hasConsensus/.test(script); // Consensus check
 
-              if (isCritical) {
+              // Check if logic has a valid "zero length" fallback pattern
+              // e.g., "if (validators.length === 0) return true" handles missing role gracefully
+              const hasZeroLengthFallback =
+                /\.length\s*===?\s*0\s*\)\s*return/.test(script) || // length === 0) return
+                /\.length\s*[<]=\s*0/.test(script); // length <= 0 or length < 1
+
+              if (isCritical && !hasZeroLengthFallback) {
                 errors.push(
                   `[Gap 15] ${prefix}: Logic references role '${role}' which doesn't exist. ` +
                     `This will cause logic to fail. Fix: Add agent with role '${role}' or update logic.`
@@ -1410,6 +1437,197 @@ function validateConfigSemantics(config) {
           }
         }
       }
+    }
+  }
+
+  return { errors, warnings };
+}
+
+function resolveProviderName(agent, config, settings) {
+  const resolved =
+    config.forceProvider ||
+    agent.provider ||
+    config.defaultProvider ||
+    settings.defaultProvider ||
+    'claude';
+  return normalizeProviderName(resolved) || 'claude';
+}
+
+function validateProviderLevel(provider, requestedLevel, minLevel, maxLevel) {
+  const providerModule = getProvider(provider);
+  const levels = providerModule.getLevelMapping();
+  const rank = (level) => levels[level]?.rank;
+
+  if (!levels[requestedLevel]) {
+    throw new Error(`Invalid level "${requestedLevel}" for provider "${provider}"`);
+  }
+
+  if (minLevel && !levels[minLevel]) {
+    throw new Error(`Invalid minLevel "${minLevel}" for provider "${provider}"`);
+  }
+
+  if (maxLevel && !levels[maxLevel]) {
+    throw new Error(`Invalid maxLevel "${maxLevel}" for provider "${provider}"`);
+  }
+
+  if (minLevel && maxLevel && rank(minLevel) > rank(maxLevel)) {
+    throw new Error(
+      `minLevel "${minLevel}" exceeds maxLevel "${maxLevel}" for provider "${provider}"`
+    );
+  }
+
+  if (maxLevel && rank(requestedLevel) > rank(maxLevel)) {
+    throw new Error(
+      `Level "${requestedLevel}" exceeds maxLevel "${maxLevel}" for provider "${provider}"`
+    );
+  }
+
+  if (minLevel && rank(requestedLevel) < rank(minLevel)) {
+    throw new Error(
+      `Level "${requestedLevel}" is below minLevel "${minLevel}" for provider "${provider}"`
+    );
+  }
+
+  return requestedLevel;
+}
+
+function validateProviderSettings(provider, providerSettings) {
+  const providerModule = getProvider(provider);
+  const levels = providerModule.getLevelMapping();
+  const settings = providerSettings || {};
+
+  const minLevel = settings.minLevel || providerModule.getDefaultMinLevel?.();
+  const maxLevel = settings.maxLevel || providerModule.getDefaultMaxLevel?.();
+  const defaultLevel = settings.defaultLevel || providerModule.getDefaultLevel();
+
+  validateProviderLevel(provider, defaultLevel, minLevel, maxLevel);
+
+  for (const [level, override] of Object.entries(settings.levelOverrides || {})) {
+    if (!levels[level]) {
+      throw new Error(`Unknown level "${level}" in overrides for provider "${provider}"`);
+    }
+    if (override?.model && (typeof override.model !== 'string' || !override.model.trim())) {
+      throw new Error(
+        `Invalid model override (must be non-empty string) for provider "${provider}"`
+      );
+    }
+    if (override?.reasoningEffort && provider !== 'codex') {
+      throw new Error(`reasoningEffort overrides are only supported for Codex`);
+    }
+    if (
+      override?.reasoningEffort &&
+      !['low', 'medium', 'high', 'xhigh'].includes(override.reasoningEffort)
+    ) {
+      throw new Error(
+        `Invalid reasoningEffort "${override.reasoningEffort}" (low|medium|high|xhigh)`
+      );
+    }
+  }
+}
+
+function validateProviderFeatures(config, settings) {
+  const errors = [];
+  const warnings = [];
+
+  const providersToValidate = VALID_PROVIDERS;
+
+  for (const provider of providersToValidate) {
+    try {
+      validateProviderSettings(provider, settings.providerSettings?.[provider]);
+    } catch (err) {
+      errors.push(err.message);
+    }
+  }
+
+  if (!config.agents || !Array.isArray(config.agents)) {
+    return { errors, warnings };
+  }
+
+  for (const agent of config.agents) {
+    if (agent.type === 'subcluster') {
+      continue;
+    }
+
+    const provider = resolveProviderName(agent, config, settings);
+    if (!VALID_PROVIDERS.includes(provider)) {
+      errors.push(`Agent "${agent.id}" references unknown provider "${provider}"`);
+      continue;
+    }
+
+    const providerModule = getProvider(provider);
+    const levels = providerModule.getLevelMapping();
+    const catalog = providerModule.getModelCatalog();
+    const providerSettings = settings.providerSettings?.[provider] || {};
+    const minLevel = providerSettings.minLevel;
+    const maxLevel = providerSettings.maxLevel;
+    const rank = (level) => levels[level]?.rank;
+
+    if (agent.jsonSchema) {
+      const cap = CAPABILITIES[provider]?.jsonSchema;
+      if (cap === 'experimental') {
+        warnings.push(
+          `Agent "${agent.id}" uses jsonSchema with ${provider} provider - ` +
+            `this feature is experimental and may not work reliably`
+        );
+      } else if (!cap) {
+        warnings.push(
+          `Agent "${agent.id}" uses jsonSchema but ${provider} provider doesn't support it`
+        );
+      }
+    }
+
+    if (agent.modelLevel && !levels[agent.modelLevel]) {
+      warnings.push(
+        `Agent "${agent.id}" uses modelLevel "${agent.modelLevel}" which is not valid for ${provider}`
+      );
+    }
+
+    if (agent.model) {
+      if (!catalog[agent.model]) {
+        warnings.push(
+          `Agent "${agent.id}" uses model "${agent.model}" which is not valid for ${provider}`
+        );
+      }
+    } else if (agent.modelLevel && minLevel && maxLevel) {
+      if (rank(minLevel) > rank(maxLevel)) {
+        warnings.push(
+          `Provider "${provider}" has minLevel "${minLevel}" above maxLevel "${maxLevel}"`
+        );
+      } else if (rank(agent.modelLevel) < rank(minLevel)) {
+        warnings.push(
+          `Agent "${agent.id}" uses modelLevel "${agent.modelLevel}" below minLevel "${minLevel}" for ${provider}`
+        );
+      } else if (rank(agent.modelLevel) > rank(maxLevel)) {
+        warnings.push(
+          `Agent "${agent.id}" uses modelLevel "${agent.modelLevel}" above maxLevel "${maxLevel}" for ${provider}`
+        );
+      }
+    }
+
+    if (agent.modelRules && Array.isArray(agent.modelRules)) {
+      for (const rule of agent.modelRules) {
+        if (rule.modelLevel && !levels[rule.modelLevel]) {
+          warnings.push(
+            `Agent "${agent.id}" uses modelLevel "${rule.modelLevel}" in modelRules which is not valid for ${provider}`
+          );
+        }
+        if (rule.model && !catalog[rule.model]) {
+          warnings.push(
+            `Agent "${agent.id}" uses model "${rule.model}" in modelRules which is not valid for ${provider}`
+          );
+        }
+      }
+    }
+
+    if (agent.reasoningEffort && provider !== 'codex') {
+      warnings.push(`Agent "${agent.id}" sets reasoningEffort but ${provider} does not support it`);
+    } else if (
+      agent.reasoningEffort &&
+      !['low', 'medium', 'high', 'xhigh'].includes(agent.reasoningEffort)
+    ) {
+      warnings.push(
+        `Agent "${agent.id}" has invalid reasoningEffort "${agent.reasoningEffort}" (low|medium|high|xhigh)`
+      );
     }
   }
 
@@ -1435,5 +1653,8 @@ module.exports = {
   validateRuleCoverage,
   detectNAgentCycles,
   validateConfigSemantics,
+  validateProviderLevel,
+  validateProviderSettings,
+  validateProviderFeatures,
   groupConsecutive,
 };

@@ -36,6 +36,7 @@ class SubClusterWrapper {
     this.childClusterId = null;
 
     this.quiet = options.quiet || false;
+    this.modelOverride = options.modelOverride || null;
   }
 
   /**
@@ -341,17 +342,31 @@ class SubClusterWrapper {
     this.childClusterId = childId;
 
     // Create child orchestrator with separate database
-    const childOrchestrator = new Orchestrator({
+    const childOrchestrator = await Orchestrator.create({
       quiet: this.quiet,
       skipLoad: true,
       storageDir: path.join(this.parentCluster.ledger.dbPath, '..', 'subclusters', childId),
     });
 
+    const childConfig = JSON.parse(JSON.stringify(this.config.config));
+    const parentConfig = this.parentCluster?.config || {};
+
+    if (parentConfig.forceProvider) {
+      childConfig.forceProvider = parentConfig.forceProvider;
+      childConfig.defaultProvider = parentConfig.forceProvider;
+      if (parentConfig.forceLevel) {
+        childConfig.forceLevel = parentConfig.forceLevel;
+        childConfig.defaultLevel = parentConfig.forceLevel;
+      }
+    } else if (parentConfig.defaultProvider && !childConfig.defaultProvider) {
+      childConfig.defaultProvider = parentConfig.defaultProvider;
+    }
+
     // Start child cluster with text input (context from parent)
     const childCluster = await childOrchestrator.start(
-      this.config.config, // Child cluster config
+      childConfig, // Child cluster config
       { text: context },
-      { testMode: false }
+      { testMode: false, modelOverride: this.modelOverride || undefined }
     );
 
     // Create message bridge

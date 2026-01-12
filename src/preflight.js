@@ -2,7 +2,7 @@
  * Preflight Validation - Check all dependencies before starting
  *
  * Validates:
- * - Claude CLI installed and authenticated
+ * - Selected provider CLI installed
  * - gh CLI installed and authenticated (if using issue numbers)
  * - Docker available (if using --docker)
  *
@@ -42,13 +42,15 @@ function formatError(title, detail, recovery) {
 }
 
 /**
- * Check if a command exists
+ * Check if a command exists (cross-platform)
  * @param {string} cmd - Command to check
  * @returns {boolean}
  */
 function commandExists(cmd) {
   try {
-    execSync(`which ${cmd}`, { encoding: 'utf8', stdio: 'pipe' });
+    // Windows uses 'where', Unix uses 'which'
+    const checkCmd = process.platform === 'win32' ? `where ${cmd}` : `which ${cmd}`;
+    execSync(checkCmd, { encoding: 'utf8', stdio: 'pipe' });
     return true;
   } catch {
     return false;
@@ -280,57 +282,45 @@ function checkDocker() {
  * @param {boolean} options.requireGit - Whether git repo is required (true if using --worktree)
  * @param {boolean} options.quiet - Suppress success messages
  * @param {string} options.claudeCommand - Custom Claude command (from settings)
+ * @param {string} options.provider - Provider override
  * @returns {ValidationResult}
  */
 function runPreflight(options = {}) {
   const errors = [];
   const warnings = [];
 
-  // Get configured Claude command (supports custom commands like 'ccr code')
-  const { getClaudeCommand } = require('../lib/settings.js');
-  const { command, args } = getClaudeCommand();
-  const claudeCommand = options.claudeCommand || [command, ...args].join(' ');
+  const { loadSettings, getClaudeCommand } = require('../lib/settings.js');
+  const { normalizeProviderName } = require('../lib/provider-names');
+  const settings = loadSettings();
+  const providerName = normalizeProviderName(
+    options.provider || settings.defaultProvider || 'claude'
+  );
 
-  // 1. Check Claude CLI installation
-  const claude = getClaudeVersion(claudeCommand);
-  if (!claude.installed) {
-    errors.push(
-      formatError(
-        'Claude command not available',
-        claude.error,
-        claudeCommand === 'claude'
-          ? [
-              'Install Claude CLI: npm install -g @anthropic-ai/claude-code',
-              'Or: brew install claude (macOS)',
-              'Then run: claude --version',
-            ]
-          : [
-              `Command '${claudeCommand}' not found`,
-              'Check settings: zeroshot settings',
-              'Update claudeCommand: zeroshot settings set claudeCommand "your-command"',
-              'Or install the missing command',
-            ]
-      )
-    );
-  } else {
-    // 2. Check Claude CLI authentication
-    const auth = checkClaudeAuth();
-    if (!auth.authenticated) {
+  if (providerName === 'claude') {
+    const { command, args } = getClaudeCommand();
+    const claudeCommand = options.claudeCommand || [command, ...args].join(' ');
+
+    const claude = getClaudeVersion(claudeCommand);
+    if (!claude.installed) {
       errors.push(
         formatError(
-          'Claude CLI not authenticated',
-          auth.error,
-          [
-            'Run: claude login',
-            'Follow the browser prompts to authenticate',
-            `Config directory: ${auth.configDir}`,
-          ]
+          'Claude command not available',
+          claude.error,
+          claudeCommand === 'claude'
+            ? [
+                'Install Claude CLI: npm install -g @anthropic-ai/claude-code',
+                'Or: brew install claude (macOS)',
+                'Then run: claude --version',
+              ]
+            : [
+                `Command '${claudeCommand}' not found`,
+                'Check settings: zeroshot settings',
+                'Update claudeCommand: zeroshot settings set claudeCommand "your-command"',
+                'Or install the missing command',
+              ]
         )
       );
-    }
-
-    // Check version (warn if old)
-    if (claude.version) {
+    } else if (claude.version) {
       const [major, minor] = claude.version.split('.').map(Number);
       if (major < 1 || (major === 1 && minor < 0)) {
         warnings.push(
@@ -338,21 +328,45 @@ function runPreflight(options = {}) {
         );
       }
     }
-  }
 
-  // 3. Check if running as root (blocks --dangerously-skip-permissions)
-  if (process.getuid && process.getuid() === 0) {
+    // Claude CLI refuses --dangerously-skip-permissions when running as root.
+    if (process.getuid && process.getuid() === 0) {
+      errors.push(
+        formatError(
+          'Running as root',
+          'Claude CLI refuses --dangerously-skip-permissions flag when running as root (UID 0)',
+          [
+            'Run as non-root user in Docker: docker run --user 1000:1000 ...',
+            'Or create non-root user: adduser testuser && su - testuser',
+            'Or use existing node user: docker run --user node ...',
+            'Security: Claude CLI blocks this flag as root to prevent privilege escalation',
+          ]
+        )
+      );
+    }
+  } else if (providerName === 'codex') {
+    if (!commandExists('codex')) {
+      errors.push(
+        formatError('Codex CLI not available', 'Command "codex" not installed', [
+          'Install Codex CLI: npm install -g @openai/codex',
+          'Then run: codex --version',
+        ])
+      );
+    }
+  } else if (providerName === 'gemini') {
+    if (!commandExists('gemini')) {
+      errors.push(
+        formatError('Gemini CLI not available', 'Command "gemini" not installed', [
+          'Install Gemini CLI: npm install -g @google/gemini-cli',
+          'Then run: gemini --version',
+        ])
+      );
+    }
+  } else {
     errors.push(
-      formatError(
-        'Running as root',
-        'Claude CLI refuses --dangerously-skip-permissions flag when running as root (UID 0)',
-        [
-          'Run as non-root user in Docker: docker run --user 1000:1000 ...',
-          'Or create non-root user: adduser testuser && su - testuser',
-          'Or use existing node user: docker run --user node ...',
-          'Security: Claude CLI blocks this flag as root to prevent privilege escalation',
-        ]
-      )
+      formatError('Unknown provider', `Provider "${providerName}" is not supported`, [
+        'Use claude, codex, or gemini',
+      ])
     );
   }
 
@@ -361,26 +375,18 @@ function runPreflight(options = {}) {
     const gh = checkGhAuth();
     if (!gh.installed) {
       errors.push(
-        formatError(
-          'GitHub CLI (gh) not installed',
-          'Required for fetching issues by number',
-          [
-            'Install: brew install gh (macOS) or apt install gh (Linux)',
-            'Or download from: https://cli.github.com/',
-          ]
-        )
+        formatError('GitHub CLI (gh) not installed', 'Required for fetching issues by number', [
+          'Install: brew install gh (macOS) or apt install gh (Linux)',
+          'Or download from: https://cli.github.com/',
+        ])
       );
     } else if (!gh.authenticated) {
       errors.push(
-        formatError(
-          'GitHub CLI (gh) not authenticated',
-          gh.error,
-          [
-            'Run: gh auth login',
-            'Select GitHub.com, HTTPS, and authenticate via browser',
-            'Then verify: gh auth status',
-          ]
-        )
+        formatError('GitHub CLI (gh) not authenticated', gh.error, [
+          'Run: gh auth login',
+          'Select GitHub.com, HTTPS, and authenticate via browser',
+          'Then verify: gh auth status',
+        ])
       );
     }
   }
@@ -415,15 +421,11 @@ function runPreflight(options = {}) {
     }
     if (!isGitRepo) {
       errors.push(
-        formatError(
-          'Not in a git repository',
-          'Worktree isolation requires a git repository',
-          [
-            'Run from within a git repository',
-            'Or use --docker instead of --worktree for non-git directories',
-            'Initialize a repo with: git init',
-          ]
-        )
+        formatError('Not in a git repository', 'Worktree isolation requires a git repository', [
+          'Run from within a git repository',
+          'Or use --docker instead of --worktree for non-git directories',
+          'Initialize a repo with: git init',
+        ])
       );
     }
   }
@@ -442,6 +444,7 @@ function runPreflight(options = {}) {
  * @param {boolean} options.requireDocker - Whether Docker is required
  * @param {boolean} options.requireGit - Whether git repo is required
  * @param {boolean} options.quiet - Suppress success messages
+ * @param {string} options.provider - Provider override
  */
 function requirePreflight(options = {}) {
   const result = runPreflight(options);
