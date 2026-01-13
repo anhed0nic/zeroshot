@@ -13,7 +13,7 @@
  * - macOS: ps + lsof
  */
 
-const { execSync } = require('child_process');
+const { execSync } = require('./lib/safe-exec'); // Enforces timeouts
 const fs = require('fs');
 
 const PLATFORM = process.platform;
@@ -77,7 +77,8 @@ function getChildPids(pid) {
         for (const tid of tids) {
           const childrenPath = `/proc/${pid}/task/${tid}/children`;
           if (fs.existsSync(childrenPath)) {
-            const childPids = fs.readFileSync(childrenPath, 'utf8')
+            const childPids = fs
+              .readFileSync(childrenPath, 'utf8')
               .trim()
               .split(/\s+/)
               .filter(Boolean)
@@ -187,17 +188,20 @@ function getNetworkStateLinux(pid) {
     hasActivity: false,
     sendQueueBytes: 0,
     recvQueueBytes: 0,
-    bytesSent: 0,      // Cumulative bytes sent across all sockets
-    bytesReceived: 0,  // Cumulative bytes received across all sockets
+    bytesSent: 0, // Cumulative bytes sent across all sockets
+    bytesReceived: 0, // Cumulative bytes received across all sockets
   };
 
   try {
     // Use ss -tip to get extended TCP info with bytes_sent/bytes_received
     // -t = TCP only, -i = show internal TCP info, -p = show process
-    const output = execSync(`ss -tip 2>/dev/null | grep -A1 "pid=${escapeShell(String(pid))}," || true`, {
-      encoding: 'utf8',
-      timeout: 3000,
-    });
+    const output = execSync(
+      `ss -tip 2>/dev/null | grep -A1 "pid=${escapeShell(String(pid))}," || true`,
+      {
+        encoding: 'utf8',
+        timeout: 3000,
+      }
+    );
 
     if (!output.trim()) {
       return result;
@@ -261,8 +265,8 @@ function getNetworkStateDarwin(pid) {
     hasActivity: false,
     sendQueueBytes: 0,
     recvQueueBytes: 0,
-    bytesSent: 0,      // Not available on macOS without root/dtrace
-    bytesReceived: 0,  // Not available on macOS without root/dtrace
+    bytesSent: 0, // Not available on macOS without root/dtrace
+    bytesReceived: 0, // Not available on macOS without root/dtrace
   };
 
   try {
@@ -281,7 +285,7 @@ function getNetworkStateDarwin(pid) {
     for (const line of lines) {
       const parts = line.split(/\s+/);
       // Look for ESTABLISHED connections
-      if (parts.includes('ESTABLISHED') || parts.some(p => p.includes('->'))) {
+      if (parts.includes('ESTABLISHED') || parts.some((p) => p.includes('->'))) {
         result.established++;
         result.hasActivity = true; // lsof doesn't show queue sizes, assume activity
       }
@@ -334,14 +338,21 @@ async function getProcessMetricsLinuxAggregated(pid, samplePeriodMs) {
       memoryMB: 0,
       state: 'X',
       threads: 0,
-      network: { established: 0, hasActivity: false, sendQueueBytes: 0, recvQueueBytes: 0, bytesSent: 0, bytesReceived: 0 },
+      network: {
+        established: 0,
+        hasActivity: false,
+        sendQueueBytes: 0,
+        recvQueueBytes: 0,
+        bytesSent: 0,
+        bytesReceived: 0,
+      },
       childCount: 0,
       timestamp: Date.now(),
     };
   }
 
   // Wait for sample period
-  await new Promise(r => setTimeout(r, samplePeriodMs));
+  await new Promise((r) => setTimeout(r, samplePeriodMs));
 
   // Get second CPU sample
   const t1Metrics = {};
@@ -385,7 +396,14 @@ async function getProcessMetricsLinuxAggregated(pid, samplePeriodMs) {
   const cpuPercent = Math.min(100, rawCpuPercent / cpuCores);
 
   // Get network state for all processes
-  let network = { established: 0, hasActivity: false, sendQueueBytes: 0, recvQueueBytes: 0, bytesSent: 0, bytesReceived: 0 };
+  let network = {
+    established: 0,
+    hasActivity: false,
+    sendQueueBytes: 0,
+    recvQueueBytes: 0,
+    bytesSent: 0,
+    bytesReceived: 0,
+  };
   for (const p of Object.keys(t1Metrics)) {
     const netState = getNetworkStateLinux(parseInt(p, 10));
     network.established += netState.established;
@@ -451,7 +469,14 @@ function getProcessMetricsDarwinAggregated(pid) {
   }
 
   // Get network state
-  let network = { established: 0, hasActivity: false, sendQueueBytes: 0, recvQueueBytes: 0, bytesSent: 0, bytesReceived: 0 };
+  let network = {
+    established: 0,
+    hasActivity: false,
+    sendQueueBytes: 0,
+    recvQueueBytes: 0,
+    bytesSent: 0,
+    bytesReceived: 0,
+  };
   for (const p of allPids) {
     const netState = getNetworkStateDarwin(p);
     network.established += netState.established;
@@ -518,13 +543,20 @@ function formatMetrics(metrics) {
  */
 function getStateIcon(state) {
   switch (state) {
-    case 'R': return '🟢'; // Running
-    case 'S': return '🔵'; // Sleeping
-    case 'D': return '🟡'; // Disk wait
-    case 'Z': return '💀'; // Zombie
-    case 'T': return '⏸️'; // Stopped
-    case 'X': return '❌'; // Dead
-    default: return '⚪';
+    case 'R':
+      return '🟢'; // Running
+    case 'S':
+      return '🔵'; // Sleeping
+    case 'D':
+      return '🟡'; // Disk wait
+    case 'Z':
+      return '💀'; // Zombie
+    case 'T':
+      return '⏸️'; // Stopped
+    case 'X':
+      return '❌'; // Dead
+    default:
+      return '⚪';
   }
 }
 

@@ -14,6 +14,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { exec, execSync } = require('../lib/safe-exec'); // Enforces timeouts - prevents infinite hangs
 const { getProvider, parseChunkWithProvider } = require('../providers');
 
 // Schema utilities for normalizing LLM output
@@ -532,16 +533,16 @@ async function spawnClaudeTask(agent, context) {
  * @returns {Promise<void>}
  */
 async function waitForTaskReady(agent, taskId, maxRetries = 10, delayMs = 200) {
-  const { exec } = require('child_process');
   const ctPath = getClaudeTasksPath();
 
   for (let i = 0; i < maxRetries; i++) {
-    const exists = await new Promise((resolve) => {
-      exec(`${ctPath} status ${taskId}`, (error, stdout) => {
-        // Task exists if status doesn't return "Task not found"
-        resolve(!error && !stdout.includes('Task not found'));
-      });
-    });
+    let exists = false;
+    try {
+      const { stdout } = await exec(`${ctPath} status ${taskId}`, { timeout: 5000 });
+      exists = !stdout.includes('Task not found');
+    } catch {
+      // Timeout or error - task not ready yet
+    }
 
     if (exists) return;
 
@@ -562,7 +563,6 @@ async function waitForTaskReady(agent, taskId, maxRetries = 10, delayMs = 200) {
  */
 function followClaudeTaskLogs(agent, taskId) {
   const fsModule = require('fs');
-  const { execSync, exec } = require('child_process');
   const ctPath = getClaudeTasksPath();
   const providerName = agent._resolveProvider ? agent._resolveProvider() : 'claude';
 
@@ -578,6 +578,7 @@ function followClaudeTaskLogs(agent, taskId) {
     try {
       logFilePath = execSync(`${ctPath} get-log-path ${taskId}`, {
         encoding: 'utf-8',
+        timeout: 5000,
       }).trim();
       agent._log(`📋 Agent ${agent.id}: Following ct logs for ${taskId}`);
     } catch {
@@ -675,6 +676,7 @@ function followClaudeTaskLogs(agent, taskId) {
         try {
           logFilePath = execSync(`${ctPath} get-log-path ${taskId}`, {
             encoding: 'utf-8',
+            timeout: 5000,
           }).trim();
           agent._log(`📋 Agent ${agent.id}: Found log file: ${logFilePath}`);
         } catch {
@@ -718,7 +720,7 @@ function followClaudeTaskLogs(agent, taskId) {
     const MAX_CONSECUTIVE_FAILURES = 30; // 30 seconds of failures = log warning
 
     statusCheckInterval = setInterval(() => {
-      exec(`${ctPath} status ${taskId}`, (error, stdout, stderr) => {
+      exec(`${ctPath} status ${taskId}`, { timeout: 5000 }, (error, stdout, stderr) => {
         if (resolved) return;
 
         // Track exec failures - if status command keeps failing, something is wrong
@@ -1405,9 +1407,8 @@ function killTask(agent) {
   // Also kill the underlying zeroshot task if we have a task ID
   // This ensures the task process is stopped, not just our polling intervals
   if (agent.currentTaskId) {
-    const { exec } = require('child_process');
     const ctPath = getClaudeTasksPath();
-    exec(`${ctPath} task kill ${agent.currentTaskId}`, (error) => {
+    exec(`${ctPath} task kill ${agent.currentTaskId}`, { timeout: 10000 }, (error) => {
       if (error) {
         // Task may have already completed or been killed, ignore errors
         agent._log(`Note: Could not kill task ${agent.currentTaskId}: ${error.message}`);

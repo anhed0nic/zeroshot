@@ -5,7 +5,8 @@
  * following logs, and assembling results.
  */
 
-const { spawn, exec, execSync } = require('child_process');
+const { spawn } = require('child_process');
+const { exec, execSync } = require('./lib/safe-exec'); // Enforces timeouts
 const fs = require('fs');
 const TaskRunner = require('./task-runner');
 const { loadSettings } = require('../lib/settings');

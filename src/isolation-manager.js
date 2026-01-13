@@ -8,7 +8,8 @@
  * - Container cleanup on stop/kill
  */
 
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
+const { execSync } = require('./lib/safe-exec'); // Enforces timeouts - prevents infinite hangs
 const { Worker } = require('worker_threads');
 const crypto = require('crypto');
 const path = require('path');
@@ -387,6 +388,7 @@ class IsolationManager {
    * @param {object} [options] - Exec options
    * @param {boolean} [options.interactive] - Use -it flags
    * @param {object} [options.env] - Environment variables
+   * @param {number} [options.timeout=30000] - Timeout in ms (0 = no timeout). Prevents infinite hangs.
    * @returns {Promise<{stdout: string, stderr: string, code: number}>}
    */
   execInContainer(clusterId, command, options = {}) {
@@ -410,6 +412,9 @@ class IsolationManager {
 
     args.push(containerId, ...command);
 
+    // Default timeout: 30 seconds (prevents infinite hangs)
+    const timeout = options.timeout ?? 30000;
+
     return new Promise((resolve, reject) => {
       const proc = spawn('docker', args, {
         stdio: options.interactive ? 'inherit' : ['pipe', 'pipe', 'pipe'],
@@ -417,6 +422,16 @@ class IsolationManager {
 
       let stdout = '';
       let stderr = '';
+      let timedOut = false;
+      let timeoutId = null;
+
+      // Set up timeout if specified (0 = no timeout)
+      if (timeout > 0) {
+        timeoutId = setTimeout(() => {
+          timedOut = true;
+          proc.kill('SIGKILL');
+        }, timeout);
+      }
 
       if (!options.interactive) {
         proc.stdout.on('data', (data) => {
@@ -428,10 +443,16 @@ class IsolationManager {
       }
 
       proc.on('close', (code) => {
-        resolve({ stdout, stderr, code });
+        if (timeoutId) clearTimeout(timeoutId);
+        if (timedOut) {
+          reject(new Error(`Docker exec timed out after ${timeout}ms`));
+        } else {
+          resolve({ stdout, stderr, code });
+        }
       });
 
       proc.on('error', (err) => {
+        if (timeoutId) clearTimeout(timeoutId);
         reject(new Error(`Docker exec error: ${err.message}`));
       });
     });

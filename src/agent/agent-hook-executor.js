@@ -8,6 +8,7 @@
  */
 
 const vm = require('vm');
+const { execSync } = require('../lib/safe-exec'); // Enforces timeouts
 
 /**
  * Execute a hook
@@ -278,7 +279,6 @@ async function substituteTemplate(params) {
       if (taskId !== 'UNKNOWN') {
         console.error(`\nFetching task logs for ${taskId}...`);
         try {
-          const { execSync } = require('child_process');
           const ctPath = agent._getClaudeTasksPath();
           taskLogs = execSync(`${ctPath} logs ${taskId} --lines 100`, {
             encoding: 'utf-8',

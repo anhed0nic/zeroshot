@@ -9,7 +9,7 @@
  * Provides CLEAR, ACTIONABLE error messages with recovery instructions.
  */
 
-const { execSync } = require('child_process');
+const { execSync } = require('./lib/safe-exec'); // Enforces timeouts
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
