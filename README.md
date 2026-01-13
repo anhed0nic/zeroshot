@@ -379,6 +379,7 @@ zeroshot settings set dockerEnvPassthrough '["MY_API_KEY", "TF_VAR_*"]'
 | Cluster stuck                 | `zeroshot resume <id>` to continue                        |
 | Agent keeps failing           | Check `zeroshot logs <id>` for actual error               |
 | `zeroshot: command not found` | `npm install -g @covibes/zeroshot`                        |
+| Prompts need optimization     | Run `/analyze-cluster-postmortem <id>` in Claude Code     |
 
 </details>
 
@@ -395,7 +396,3 @@ For security issues, see [SECURITY.md](SECURITY.md).
 MIT - [Covibes](https://github.com/covibes)
 
 Built on [Claude Code](https://claude.com/product/claude-code) by Anthropic.
-
----
-
-<sub>**Claude Code users:** Run `/analyze-cluster-postmortem` to analyze failures and optimize prompts.</sub>
