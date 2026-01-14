@@ -333,12 +333,25 @@ async function substituteTemplate(params) {
     return stringified.slice(1, -1);
   };
 
+  // Helper to escape template-like patterns in substituted values
+  // This prevents content containing "{{result.foo}}" from being flagged as unsubstituted variables
+  // Uses Unicode escape for first brace: {{ -> \u007B{ (invisible to humans, breaks pattern match)
+  const escapeTemplatePatterns = (str) => {
+    return str.replace(/\{\{/g, '\\u007B{');
+  };
+
   let substituted = json
-    .replace(/\{\{cluster\.id\}\}/g, cluster.id)
+    .replace(/\{\{cluster\.id\}\}/g, escapeTemplatePatterns(cluster.id))
     .replace(/\{\{cluster\.createdAt\}\}/g, String(cluster.createdAt))
     .replace(/\{\{iteration\}\}/g, String(agent.iteration))
-    .replace(/\{\{error\.message\}\}/g, escapeForJsonString(context.error?.message ?? ''))
-    .replace(/\{\{result\.output\}\}/g, escapeForJsonString(context.result?.output ?? ''));
+    .replace(
+      /\{\{error\.message\}\}/g,
+      escapeTemplatePatterns(escapeForJsonString(context.error?.message ?? ''))
+    )
+    .replace(
+      /\{\{result\.output\}\}/g,
+      escapeTemplatePatterns(escapeForJsonString(context.result?.output ?? ''))
+    );
 
   // Substitute ALL result.* variables dynamically from parsed resultData
   if (resultData) {
@@ -364,7 +377,8 @@ async function substituteTemplate(params) {
         return String(value);
       }
       // Strings need to be quoted and escaped for JSON
-      return JSON.stringify(value);
+      // Also escape any template-like patterns in the content to prevent false positives
+      return escapeTemplatePatterns(JSON.stringify(value));
     });
   }
 
