@@ -1278,70 +1278,63 @@ function groupConsecutive(numbers) {
  * @param {Object} config - Cluster configuration
  * @returns {{ errors: string[], warnings: string[] }}
  */
-function detectNAgentCycles(config) {
-  const errors = [];
-  const warnings = [];
+function collectAgentDependencies(agent, topicProducers) {
+  const dependencies = new Set();
 
-  if (!config.agents || !Array.isArray(config.agents)) {
-    return { errors, warnings };
+  for (const trigger of agent.triggers || []) {
+    const topic = trigger.topic;
+    if (topic === 'ISSUE_OPENED' || topic === 'CLUSTER_RESUMED') continue;
+    if (topic.endsWith('*')) continue;
+
+    const producers = topicProducers.get(topic) || [];
+    for (const producer of producers) {
+      if (producer !== agent.id) {
+        dependencies.add(producer);
+      }
+    }
   }
 
-  // Build agent dependency graph: agent -> [agents it depends on]
-  const agentGraph = new Map();
-  const topicProducers = new Map(); // topic -> [agentIds]
+  return Array.from(dependencies);
+}
 
-  // Initialize graph
+function buildAgentGraph(config) {
+  const agentGraph = new Map();
+  const topicProducers = new Map();
+
   for (const agent of config.agents) {
     if (agent.type === 'subcluster') continue;
     agentGraph.set(agent.id, []);
 
-    // Track what topics this agent produces
     const outputTopic = agent.hooks?.onComplete?.config?.topic;
-    if (outputTopic) {
-      if (!topicProducers.has(outputTopic)) {
-        topicProducers.set(outputTopic, []);
-      }
-      topicProducers.get(outputTopic).push(agent.id);
+    if (!outputTopic) continue;
+
+    if (!topicProducers.has(outputTopic)) {
+      topicProducers.set(outputTopic, []);
     }
+    topicProducers.get(outputTopic).push(agent.id);
   }
 
-  // Build dependencies: agent consumes topic -> depends on agents that produce it
   for (const agent of config.agents) {
     if (agent.type === 'subcluster') continue;
-
-    const dependencies = new Set();
-
-    for (const trigger of agent.triggers || []) {
-      const topic = trigger.topic;
-      if (topic === 'ISSUE_OPENED' || topic === 'CLUSTER_RESUMED') continue;
-      if (topic.endsWith('*')) continue; // Skip wildcards
-
-      const producers = topicProducers.get(topic) || [];
-      for (const producer of producers) {
-        if (producer !== agent.id) {
-          dependencies.add(producer);
-        }
-      }
-    }
-
-    agentGraph.set(agent.id, Array.from(dependencies));
+    agentGraph.set(agent.id, collectAgentDependencies(agent, topicProducers));
   }
 
-  // === GAP 6: Detect cycles with DFS ===
+  return agentGraph;
+}
+
+function findFirstCycle(agentGraph) {
   const visited = new Set();
   const recursionStack = new Set();
 
-  function dfs(agentId, path) {
+  const dfs = (agentId, path) => {
     visited.add(agentId);
     recursionStack.add(agentId);
 
     const dependencies = agentGraph.get(agentId) || [];
     for (const nextAgent of dependencies) {
       if (recursionStack.has(nextAgent)) {
-        // Cycle detected - return the full cycle path
         const cycleStartIndex = path.indexOf(nextAgent);
-        const cyclePath = [...path.slice(cycleStartIndex), nextAgent];
-        return cyclePath;
+        return [...path.slice(cycleStartIndex), nextAgent];
       }
 
       if (!visited.has(nextAgent)) {
@@ -1352,34 +1345,46 @@ function detectNAgentCycles(config) {
 
     recursionStack.delete(agentId);
     return null;
-  }
+  };
 
-  // Check all agents as starting points
   for (const agentId of agentGraph.keys()) {
     if (!visited.has(agentId)) {
       const cycle = dfs(agentId, [agentId]);
-      if (cycle) {
-        // Check if cycle has escape logic (any agent in cycle has trigger logic)
-        const hasEscapeLogic = cycle.some((id) => {
-          const agent = config.agents.find((a) => a.id === id);
-          return agent?.triggers?.some((t) => t.logic);
-        });
+      if (cycle) return cycle;
+    }
+  }
 
-        const cycleStr = cycle.join(' → ');
-        if (!hasEscapeLogic) {
-          errors.push(
-            `[Gap 6] Circular dependency detected: ${cycleStr}. ` +
-              `Fix: Add logic conditions to break the loop, or set maxIterations on involved agents.`
-          );
-        } else {
-          warnings.push(
-            `Circular dependency detected: ${cycleStr}. ` +
-              `Has escape logic in triggers, but verify maxIterations is set to prevent infinite loops.`
-          );
-        }
-        // Only report first cycle to avoid noise
-        break;
-      }
+  return null;
+}
+
+function detectNAgentCycles(config) {
+  const errors = [];
+  const warnings = [];
+
+  if (!config.agents || !Array.isArray(config.agents)) {
+    return { errors, warnings };
+  }
+
+  const agentGraph = buildAgentGraph(config);
+  const cycle = findFirstCycle(agentGraph);
+
+  if (cycle) {
+    const agentsById = new Map(
+      config.agents.filter((agent) => agent.type !== 'subcluster').map((agent) => [agent.id, agent])
+    );
+    const hasEscapeLogic = cycle.some((id) => agentsById.get(id)?.triggers?.some((t) => t.logic));
+    const cycleStr = cycle.join(' → ');
+
+    if (!hasEscapeLogic) {
+      errors.push(
+        `[Gap 6] Circular dependency detected: ${cycleStr}. ` +
+          `Fix: Add logic conditions to break the loop, or set maxIterations on involved agents.`
+      );
+    } else {
+      warnings.push(
+        `Circular dependency detected: ${cycleStr}. ` +
+          `Has escape logic in triggers, but verify maxIterations is set to prevent infinite loops.`
+      );
     }
   }
 
