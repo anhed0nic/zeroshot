@@ -63,33 +63,36 @@ function extractFromResultWrapper(output) {
 
     try {
       const obj = JSON.parse(content);
-
-      // Must be type:result WITH actual content
-      if (obj.type !== 'result') continue;
-
-      // Check structured_output first (standard CLI format)
-      if (obj.structured_output && typeof obj.structured_output === 'object') {
-        return obj.structured_output;
-      }
-
-      // Check result field - can be object or string
-      if (obj.result) {
-        if (typeof obj.result === 'object') {
-          return obj.result;
-        }
-
-        // Result is string - might contain markdown-wrapped JSON
-        if (typeof obj.result === 'string') {
-          const extracted = extractFromMarkdown(obj.result) || extractDirectJson(obj.result);
-          if (extracted) return extracted;
-        }
-      }
+      const extracted = extractResultContent(obj);
+      if (extracted) return extracted;
     } catch {
       // Not valid JSON, continue to next line
     }
   }
 
   return null;
+}
+
+function extractResultContent(obj) {
+  // Must be type:result WITH actual content
+  if (obj?.type !== 'result') return null;
+
+  // Check structured_output first (standard CLI format)
+  if (obj.structured_output && typeof obj.structured_output === 'object') {
+    return obj.structured_output;
+  }
+
+  // Check result field - can be object or string
+  if (!obj.result) return null;
+
+  if (typeof obj.result === 'object') {
+    return obj.result;
+  }
+
+  if (typeof obj.result !== 'string') return null;
+
+  // Result is string - might contain markdown-wrapped JSON
+  return extractFromMarkdown(obj.result) || extractDirectJson(obj.result);
 }
 
 /**
