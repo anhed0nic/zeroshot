@@ -652,50 +652,11 @@ class Orchestrator {
     const messageBus = new MessageBus(ledger);
 
     // Handle isolation mode (Docker container OR git worktree)
-    let isolationManager = null;
-    let containerId = null;
-    let worktreeInfo = null;
-
-    if (options.isolation) {
-      // Check Docker availability
-      if (!IsolationManager.isDockerAvailable()) {
-        throw new Error('Docker is not available. Install Docker to use --docker mode.');
-      }
-
-      // Ensure image exists (auto-build if missing)
-      const image = options.isolationImage || 'zeroshot-cluster-base';
-      await IsolationManager.ensureImage(image);
-
-      isolationManager = new IsolationManager({ image });
-      this._log(`[Orchestrator] Starting cluster in isolation mode (image: ${image})`);
-
-      // Create container with workspace mounted
-      // CRITICAL: Use options.cwd (git repo root) instead of process.cwd()
-      const workDir = options.cwd || process.cwd();
-      const providerName = normalizeProviderName(
-        config.forceProvider || config.defaultProvider || loadSettings().defaultProvider || 'claude'
-      );
-      containerId = await isolationManager.createContainer(clusterId, {
-        workDir,
-        image,
-        // Mount configuration (CLI overrides)
-        noMounts: options.noMounts,
-        mounts: options.mounts,
-        containerHome: options.containerHome,
-        provider: providerName,
-      });
-      this._log(`[Orchestrator] Container created: ${containerId} (workDir: ${workDir})`);
-    } else if (options.worktree) {
-      // Worktree isolation: lightweight git-based isolation (no Docker required)
-      const workDir = options.cwd || process.cwd();
-
-      isolationManager = new IsolationManager({});
-      worktreeInfo = isolationManager.createWorktreeIsolation(clusterId, workDir);
-
-      this._log(`[Orchestrator] Starting cluster in worktree isolation mode`);
-      this._log(`[Orchestrator] Worktree: ${worktreeInfo.path}`);
-      this._log(`[Orchestrator] Branch: ${worktreeInfo.branch}`);
-    }
+    const { isolationManager, containerId, worktreeInfo } = await this._initializeIsolation(
+      options,
+      config,
+      clusterId
+    );
 
     // Build cluster object
     // CRITICAL: initComplete promise ensures ISSUE_OPENED is published before stop() completes
@@ -1134,6 +1095,49 @@ class Orchestrator {
       console.error(`Cluster ${clusterId} failed to start:`, error);
       throw error;
     }
+  }
+
+  async _initializeIsolation(options, config, clusterId) {
+    let isolationManager = null;
+    let containerId = null;
+    let worktreeInfo = null;
+
+    if (options.isolation) {
+      if (!IsolationManager.isDockerAvailable()) {
+        throw new Error('Docker is not available. Install Docker to use --docker mode.');
+      }
+
+      const image = options.isolationImage || 'zeroshot-cluster-base';
+      await IsolationManager.ensureImage(image);
+
+      isolationManager = new IsolationManager({ image });
+      this._log(`[Orchestrator] Starting cluster in isolation mode (image: ${image})`);
+
+      const workDir = options.cwd || process.cwd();
+      const providerName = normalizeProviderName(
+        config.forceProvider || config.defaultProvider || loadSettings().defaultProvider || 'claude'
+      );
+      containerId = await isolationManager.createContainer(clusterId, {
+        workDir,
+        image,
+        noMounts: options.noMounts,
+        mounts: options.mounts,
+        containerHome: options.containerHome,
+        provider: providerName,
+      });
+      this._log(`[Orchestrator] Container created: ${containerId} (workDir: ${workDir})`);
+    } else if (options.worktree) {
+      const workDir = options.cwd || process.cwd();
+
+      isolationManager = new IsolationManager({});
+      worktreeInfo = isolationManager.createWorktreeIsolation(clusterId, workDir);
+
+      this._log(`[Orchestrator] Starting cluster in worktree isolation mode`);
+      this._log(`[Orchestrator] Worktree: ${worktreeInfo.path}`);
+      this._log(`[Orchestrator] Branch: ${worktreeInfo.branch}`);
+    }
+
+    return { isolationManager, containerId, worktreeInfo };
   }
 
   async _resolveInputData(input) {
