@@ -7,9 +7,26 @@
 const assert = require('assert');
 const { evaluateHookLogic, deepMerge } = require('../../src/agent/agent-hook-executor');
 
-describe('Hook Logic Executor', function () {
-  // === DEEP MERGE TESTS ===
+const mockAgent = {
+  id: 'test-worker',
+  role: 'implementation',
+  iteration: 1,
+  _log: () => {},
+};
 
+const mockContext = {
+  triggeringMessage: { topic: 'TEST', content: { text: 'test' } },
+};
+
+describe('Hook Logic Executor', function () {
+  registerDeepMergeTests();
+  registerEvaluateHookLogicBaseTests();
+  registerEvaluateHookLogicReturnTests();
+  registerEvaluateHookLogicDataAccessTests();
+  registerEvaluateHookLogicErrorTests();
+});
+
+function registerDeepMergeTests() {
   describe('deepMerge', function () {
     it('should merge simple objects', function () {
       const target = { a: 1, b: 2 };
@@ -52,22 +69,10 @@ describe('Hook Logic Executor', function () {
       assert.deepStrictEqual(source, { b: 2 });
     });
   });
+}
 
-  // === EVALUATE HOOK LOGIC TESTS ===
-
-  describe('evaluateHookLogic', function () {
-    // Mock agent for testing
-    const mockAgent = {
-      id: 'test-worker',
-      role: 'implementation',
-      iteration: 1,
-      _log: () => {},
-    };
-
-    const mockContext = {
-      triggeringMessage: { topic: 'TEST', content: { text: 'test' } },
-    };
-
+function registerEvaluateHookLogicBaseTests() {
+  describe('evaluateHookLogic - base cases', function () {
     it('should return null for missing logic', function () {
       const result = evaluateHookLogic({
         logic: null,
@@ -98,7 +103,11 @@ describe('Hook Logic Executor', function () {
         });
       }, /Unsupported hook logic engine/);
     });
+  });
+}
 
+function registerEvaluateHookLogicReturnTests() {
+  describe('evaluateHookLogic - return values', function () {
     it('should return config override when script returns object', function () {
       const result = evaluateHookLogic({
         logic: {
@@ -152,7 +161,11 @@ describe('Hook Logic Executor', function () {
         });
       }, /must return an object or undefined/);
     });
+  });
+}
 
+function registerEvaluateHookLogicDataAccessTests() {
+  describe('evaluateHookLogic - data access', function () {
     it('should have access to result data', function () {
       const result = evaluateHookLogic({
         logic: {
@@ -195,7 +208,11 @@ describe('Hook Logic Executor', function () {
       });
       assert.deepEqual(result, { agentId: 'test-worker', iteration: 1 });
     });
+  });
+}
 
+function registerEvaluateHookLogicErrorTests() {
+  describe('evaluateHookLogic - error handling', function () {
     it('should throw on script runtime error', function () {
       assert.throws(() => {
         evaluateHookLogic({
@@ -224,4 +241,4 @@ describe('Hook Logic Executor', function () {
       }, /timed out|Script execution/i);
     });
   });
-});
+}
