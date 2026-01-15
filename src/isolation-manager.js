@@ -743,58 +743,80 @@ class IsolationManager {
     const files = [];
     const directories = new Set();
 
-    const collectFiles = (currentSrc, relativePath = '') => {
-      let entries;
+    const shouldIgnoreFsError = (err) =>
+      err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'ENOENT';
+
+    const shouldExcludeEntry = (entryName) => {
+      return exclude.some((pattern) => {
+        if (pattern.startsWith('*.')) {
+          return entryName.endsWith(pattern.slice(1));
+        }
+        return entryName === pattern;
+      });
+    };
+
+    const ensureParentDirTracked = (relativePath) => {
+      if (relativePath) {
+        directories.add(relativePath);
+      }
+    };
+
+    const readEntries = (currentSrc) => {
       try {
-        entries = fs.readdirSync(currentSrc, { withFileTypes: true });
+        return fs.readdirSync(currentSrc, { withFileTypes: true });
       } catch (err) {
-        if (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'ENOENT') {
-          return;
+        if (shouldIgnoreFsError(err)) {
+          return [];
         }
         throw err;
       }
+    };
+
+    function handleEntry(entry, srcPath, relPath, relativePath) {
+      if (entry.isSymbolicLink()) {
+        const targetStats = fs.statSync(srcPath);
+        if (targetStats.isDirectory()) {
+          directories.add(relPath);
+          collectFiles(srcPath, relPath);
+          return;
+        }
+
+        files.push(relPath);
+        ensureParentDirTracked(relativePath);
+        return;
+      }
+
+      if (entry.isDirectory()) {
+        directories.add(relPath);
+        collectFiles(srcPath, relPath);
+        return;
+      }
+
+      files.push(relPath);
+      ensureParentDirTracked(relativePath);
+    }
+
+    function collectFiles(currentSrc, relativePath = '') {
+      const entries = readEntries(currentSrc);
 
       for (const entry of entries) {
-        // Check exclusions (exact match or glob pattern)
-        const shouldExclude = exclude.some((pattern) => {
-          if (pattern.startsWith('*.')) {
-            return entry.name.endsWith(pattern.slice(1));
-          }
-          return entry.name === pattern;
-        });
-        if (shouldExclude) continue;
+        if (shouldExcludeEntry(entry.name)) {
+          continue;
+        }
 
         const srcPath = path.join(currentSrc, entry.name);
         const relPath = relativePath ? path.join(relativePath, entry.name) : entry.name;
 
         try {
-          // Handle symlinks: resolve to actual target
-          if (entry.isSymbolicLink()) {
-            const targetStats = fs.statSync(srcPath);
-            if (targetStats.isDirectory()) {
-              directories.add(relPath);
-              collectFiles(srcPath, relPath);
-            } else {
-              files.push(relPath);
-              // Ensure parent directory is tracked
-              if (relativePath) directories.add(relativePath);
-            }
-          } else if (entry.isDirectory()) {
-            directories.add(relPath);
-            collectFiles(srcPath, relPath);
-          } else {
-            files.push(relPath);
-            // Ensure parent directory is tracked
-            if (relativePath) directories.add(relativePath);
-          }
+          handleEntry(entry, srcPath, relPath, relativePath);
         } catch (err) {
-          if (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'ENOENT') {
+          if (shouldIgnoreFsError(err)) {
             continue;
           }
           throw err;
         }
       }
-    };
+    }
 
     collectFiles(src);
 
@@ -1001,33 +1023,48 @@ class IsolationManager {
   _preserveTerraformState(clusterId, isolatedPath) {
     const stateFiles = ['terraform.tfstate', 'terraform.tfstate.backup', 'tfplan'];
     const checkDirs = [isolatedPath, path.join(isolatedPath, 'terraform')];
+    const stateDir = path.join(os.homedir(), '.zeroshot', 'terraform-state', clusterId);
+
+    const hasStateFiles = (checkDir) => {
+      if (!fs.existsSync(checkDir)) {
+        return false;
+      }
+
+      return stateFiles.some((file) => fs.existsSync(path.join(checkDir, file)));
+    };
+
+    const copyStateFiles = (checkDir) => {
+      let copied = false;
+
+      for (const file of stateFiles) {
+        const srcPath = path.join(checkDir, file);
+        if (!fs.existsSync(srcPath)) {
+          continue;
+        }
+
+        const destPath = path.join(stateDir, file);
+        try {
+          fs.copyFileSync(srcPath, destPath);
+          console.log(`[IsolationManager] Preserved Terraform state: ${file} → ${stateDir}`);
+          copied = true;
+        } catch (err) {
+          console.warn(`[IsolationManager] Failed to preserve ${file}: ${err.message}`);
+        }
+      }
+
+      return copied;
+    };
 
     let foundState = false;
 
     for (const checkDir of checkDirs) {
-      if (!fs.existsSync(checkDir)) continue;
-
-      const hasStateFiles = stateFiles.some((file) => fs.existsSync(path.join(checkDir, file)));
-
-      if (hasStateFiles) {
-        const stateDir = path.join(os.homedir(), '.zeroshot', 'terraform-state', clusterId);
-        fs.mkdirSync(stateDir, { recursive: true });
-
-        for (const file of stateFiles) {
-          const srcPath = path.join(checkDir, file);
-          if (fs.existsSync(srcPath)) {
-            const destPath = path.join(stateDir, file);
-            try {
-              fs.copyFileSync(srcPath, destPath);
-              console.log(`[IsolationManager] Preserved Terraform state: ${file} → ${stateDir}`);
-              foundState = true;
-            } catch (err) {
-              console.warn(`[IsolationManager] Failed to preserve ${file}: ${err.message}`);
-            }
-          }
-        }
-        break; // Only backup from first dir with state files
+      if (!hasStateFiles(checkDir)) {
+        continue;
       }
+
+      fs.mkdirSync(stateDir, { recursive: true });
+      foundState = copyStateFiles(checkDir);
+      break;
     }
 
     if (!foundState) {
