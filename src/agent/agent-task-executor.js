@@ -1253,6 +1253,196 @@ async function spawnClaudeTaskIsolated(agent, context) {
  * - Status checks reduced to every 2 seconds (not every poll)
  * - Result: 10-20% overall latency reduction
  */
+function createIsolatedLogState() {
+  return {
+    taskExited: false,
+    fullOutput: '',
+    tailProcess: null,
+    statusCheckInterval: null,
+    lineBuffer: '',
+  };
+}
+
+function buildIsolatedCleanup(state) {
+  return () => {
+    if (state.tailProcess) {
+      try {
+        state.tailProcess.kill('SIGTERM');
+      } catch {
+        // Ignore - process may already be dead
+      }
+      state.tailProcess = null;
+    }
+    if (state.statusCheckInterval) {
+      clearInterval(state.statusCheckInterval);
+      state.statusCheckInterval = null;
+    }
+  };
+}
+
+function broadcastIsolatedLine({ agent, providerName, taskId, line }) {
+  const timestampMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*(.*)$/);
+  const timestamp = timestampMatch ? new Date(timestampMatch[1]).getTime() : Date.now();
+  const content = timestampMatch ? timestampMatch[2] : line;
+
+  agent.messageBus.publish({
+    cluster_id: agent.cluster.id,
+    topic: 'AGENT_OUTPUT',
+    sender: agent.id,
+    content: {
+      data: {
+        line: content,
+        taskId,
+        iteration: agent.iteration,
+        provider: providerName,
+      },
+    },
+    timestamp,
+  });
+
+  agent.lastOutputTime = Date.now();
+}
+
+function appendIsolatedContent(state, content, onLine) {
+  state.lineBuffer += content;
+  const lines = state.lineBuffer.split('\n');
+
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (lines[i].trim()) {
+      onLine(lines[i]);
+    }
+  }
+
+  state.lineBuffer = lines[lines.length - 1];
+}
+
+function startIsolatedTail({ agent, manager, clusterId, logFilePath, state, onLine }) {
+  state.tailProcess = manager.spawnInContainer(clusterId, [
+    'sh',
+    '-c',
+    `while [ ! -f "${logFilePath}" ]; do sleep 0.1; done; tail -F -n +1 "${logFilePath}"`,
+  ]);
+
+  state.tailProcess.stdout.on('data', (data) => {
+    const chunk = data.toString();
+    state.fullOutput += chunk;
+    appendIsolatedContent(state, chunk, onLine);
+  });
+
+  state.tailProcess.stderr.on('data', (data) => {
+    const msg = data.toString().trim();
+    if (msg && !msg.includes('file truncated')) {
+      agent._log(`[${agent.id}] tail stderr: ${msg}`);
+    }
+  });
+
+  state.tailProcess.on('close', (exitCode) => {
+    if (!state.taskExited) {
+      agent._log(`[${agent.id}] tail process exited with code ${exitCode}`);
+    }
+  });
+
+  state.tailProcess.on('error', (err) => {
+    agent._log(`[${agent.id}] tail process error: ${err.message}`);
+  });
+}
+
+async function checkIsolatedStatus({
+  agent,
+  manager,
+  clusterId,
+  logFilePath,
+  taskId,
+  providerName,
+  state,
+  cleanup,
+  resolve,
+  onLine,
+}) {
+  if (state.taskExited) return;
+
+  const statusResult = await manager.execInContainer(clusterId, [
+    'sh',
+    '-c',
+    `zeroshot status ${taskId} 2>/dev/null || echo "not_found"`,
+  ]);
+
+  const statusOutput = statusResult.stdout;
+  const isSuccess = /Status:\s+completed/i.test(statusOutput);
+  const isError = /Status:\s+failed/i.test(statusOutput);
+  const isNotFound = statusOutput.includes('not_found');
+
+  if (!isSuccess && !isError && !isNotFound) {
+    return;
+  }
+
+  state.taskExited = true;
+  await new Promise((r) => setTimeout(r, 200));
+
+  const finalReadResult = await manager.execInContainer(clusterId, [
+    'sh',
+    '-c',
+    `cat "${logFilePath}" 2>/dev/null || echo ""`,
+  ]);
+
+  if (finalReadResult.code === 0 && finalReadResult.stdout) {
+    state.fullOutput = finalReadResult.stdout;
+    const remainingLines = state.fullOutput.split('\n');
+    for (const line of remainingLines) {
+      if (line.trim()) {
+        onLine(line);
+      }
+    }
+  }
+
+  cleanup();
+
+  const success = isSuccess && !isError;
+  const errorContext = !success
+    ? extractErrorContext({ output: state.fullOutput, taskId, isNotFound })
+    : null;
+  const parsedResult = await agent._parseResultOutput(state.fullOutput);
+
+  resolve({
+    success,
+    output: state.fullOutput,
+    taskId,
+    result: parsedResult,
+    error: errorContext,
+    tokenUsage: extractTokenUsage(state.fullOutput, providerName),
+  });
+}
+
+function startIsolatedStatusChecks({
+  agent,
+  manager,
+  clusterId,
+  logFilePath,
+  taskId,
+  providerName,
+  state,
+  cleanup,
+  resolve,
+  onLine,
+}) {
+  state.statusCheckInterval = setInterval(() => {
+    checkIsolatedStatus({
+      agent,
+      manager,
+      clusterId,
+      logFilePath,
+      taskId,
+      providerName,
+      state,
+      cleanup,
+      resolve,
+      onLine,
+    }).catch((statusErr) => {
+      agent._log(`[${agent.id}] Status check error (will retry): ${statusErr.message}`);
+    });
+  }, 2000);
+}
+
 function followClaudeTaskLogsIsolated(agent, taskId) {
   const { isolation } = agent;
   if (!isolation?.manager) {
@@ -1264,70 +1454,10 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
   const providerName = agent._resolveProvider ? agent._resolveProvider() : 'claude';
 
   return new Promise((resolve, reject) => {
-    let taskExited = false;
-    let fullOutput = '';
-    let tailProcess = null;
-    let statusCheckInterval = null;
-    let lineBuffer = '';
+    const state = createIsolatedLogState();
+    const cleanup = buildIsolatedCleanup(state);
+    const onLine = (line) => broadcastIsolatedLine({ agent, providerName, taskId, line });
 
-    // Cleanup function - kill tail process and clear intervals
-    const cleanup = () => {
-      if (tailProcess) {
-        try {
-          tailProcess.kill('SIGTERM');
-        } catch {
-          // Ignore - process may already be dead
-        }
-        tailProcess = null;
-      }
-      if (statusCheckInterval) {
-        clearInterval(statusCheckInterval);
-        statusCheckInterval = null;
-      }
-    };
-
-    // Broadcast line helper (same as non-isolated mode)
-    const broadcastLine = (line) => {
-      const timestampMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*(.*)$/);
-      const timestamp = timestampMatch ? new Date(timestampMatch[1]).getTime() : Date.now();
-      const content = timestampMatch ? timestampMatch[2] : line;
-
-      agent.messageBus.publish({
-        cluster_id: agent.cluster.id,
-        topic: 'AGENT_OUTPUT',
-        sender: agent.id,
-        content: {
-          data: {
-            line: content,
-            taskId,
-            iteration: agent.iteration,
-            provider: providerName,
-          },
-        },
-        timestamp,
-      });
-
-      // Update last output time for liveness tracking
-      agent.lastOutputTime = Date.now();
-    };
-
-    // Process new content by splitting into complete lines
-    const processNewContent = (content) => {
-      lineBuffer += content;
-      const lines = lineBuffer.split('\n');
-
-      // Process all complete lines (all except last, which might be incomplete)
-      for (let i = 0; i < lines.length - 1; i++) {
-        if (lines[i].trim()) {
-          broadcastLine(lines[i]);
-        }
-      }
-
-      // Keep last line in buffer (might be incomplete)
-      lineBuffer = lines[lines.length - 1];
-    };
-
-    // Get log file path from zeroshot CLI inside container
     manager
       .execInContainer(clusterId, ['sh', '-c', `zeroshot get-log-path ${taskId}`])
       .then(({ stdout, stderr, code }) => {
@@ -1346,117 +1476,31 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
 
         agent._log(`[${agent.id}] Following isolated task logs (streaming): ${logFilePath}`);
 
-        // Start persistent tail -f stream
-        // Uses spawnInContainer() which creates a single docker exec process
-        // that streams output in real-time (no polling overhead)
-        tailProcess = manager.spawnInContainer(clusterId, [
-          'sh',
-          '-c',
-          // Wait for file to exist, then tail -f from beginning
-          // The -F flag handles file recreation (rotation)
-          `while [ ! -f "${logFilePath}" ]; do sleep 0.1; done; tail -F -n +1 "${logFilePath}"`,
-        ]);
-
-        // Stream stdout directly - lines arrive as they're written
-        tailProcess.stdout.on('data', (data) => {
-          const chunk = data.toString();
-          fullOutput += chunk;
-          processNewContent(chunk);
+        startIsolatedTail({
+          agent,
+          manager,
+          clusterId,
+          logFilePath,
+          state,
+          onLine,
         });
 
-        // Log stderr but don't fail (tail might emit warnings)
-        tailProcess.stderr.on('data', (data) => {
-          const msg = data.toString().trim();
-          if (msg && !msg.includes('file truncated')) {
-            agent._log(`[${agent.id}] tail stderr: ${msg}`);
-          }
+        startIsolatedStatusChecks({
+          agent,
+          manager,
+          clusterId,
+          logFilePath,
+          taskId,
+          providerName,
+          state,
+          cleanup,
+          resolve,
+          onLine,
         });
 
-        // Handle tail process exit (shouldn't happen unless killed)
-        tailProcess.on('close', (exitCode) => {
-          if (!taskExited) {
-            agent._log(`[${agent.id}] tail process exited with code ${exitCode}`);
-          }
-        });
-
-        tailProcess.on('error', (err) => {
-          agent._log(`[${agent.id}] tail process error: ${err.message}`);
-        });
-
-        // Check task status periodically (every 2 seconds - much less frequent than polling)
-        // This is the only remaining docker exec - but now at 2s intervals instead of 500ms
-        statusCheckInterval = setInterval(async () => {
-          if (taskExited) return;
-
-          try {
-            const statusResult = await manager.execInContainer(clusterId, [
-              'sh',
-              '-c',
-              `zeroshot status ${taskId} 2>/dev/null || echo "not_found"`,
-            ]);
-
-            const statusOutput = statusResult.stdout;
-            const isSuccess = /Status:\s+completed/i.test(statusOutput);
-            const isError = /Status:\s+failed/i.test(statusOutput);
-            const isNotFound = statusOutput.includes('not_found');
-
-            if (isSuccess || isError || isNotFound) {
-              taskExited = true;
-
-              // Give tail a moment to flush remaining output
-              await new Promise((r) => setTimeout(r, 200));
-
-              // Read final output to ensure we have everything
-              const finalReadResult = await manager.execInContainer(clusterId, [
-                'sh',
-                '-c',
-                `cat "${logFilePath}" 2>/dev/null || echo ""`,
-              ]);
-
-              if (finalReadResult.code === 0 && finalReadResult.stdout) {
-                fullOutput = finalReadResult.stdout;
-
-                // Process any remaining content
-                const remainingLines = fullOutput.split('\n');
-                for (const line of remainingLines) {
-                  if (line.trim()) {
-                    broadcastLine(line);
-                  }
-                }
-              }
-
-              cleanup();
-
-              // Determine success status
-              const success = isSuccess && !isError;
-
-              // Extract error context using shared helper
-              const errorContext = !success
-                ? extractErrorContext({ output: fullOutput, taskId, isNotFound })
-                : null;
-
-              // Parse result from output (async - may trigger reformatting)
-              const parsedResult = await agent._parseResultOutput(fullOutput);
-
-              resolve({
-                success,
-                output: fullOutput,
-                taskId,
-                result: parsedResult,
-                error: errorContext,
-                tokenUsage: extractTokenUsage(fullOutput, providerName),
-              });
-            }
-          } catch (statusErr) {
-            // Log error but continue checking (transient failures are common)
-            agent._log(`[${agent.id}] Status check error (will retry): ${statusErr.message}`);
-          }
-        }, 2000); // Check every 2 seconds (was 500ms in polling mode)
-
-        // Safety timeout (0 = no timeout, task runs until completion)
         if (agent.timeout > 0) {
           setTimeout(() => {
-            if (!taskExited) {
+            if (!state.taskExited) {
               cleanup();
               reject(new Error(`Task ${taskId} timeout after ${agent.timeout}ms (isolated mode)`));
             }
