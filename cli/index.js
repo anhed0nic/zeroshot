@@ -4417,276 +4417,316 @@ const lineBuffers = new Map();
 // Track current tool call per sender - needed for matching tool results with calls
 const currentToolCall = new Map();
 
+function formatLogTimestamp(timestamp) {
+  return new Date(timestamp).toLocaleTimeString('en-US', {
+    hour12: false,
+  });
+}
+
+function getRenderPrefix(sender) {
+  const color = getColorForSender(sender);
+  return color(`${sender.padEnd(15)} |`);
+}
+
+function getRenderBuffer(buffers, sender) {
+  if (!buffers.has(sender)) {
+    buffers.set(sender, { text: '', needsPrefix: true });
+  }
+  return buffers.get(sender);
+}
+
+function flushRenderBuffer(buffers, sender, prefix, lines) {
+  const buf = buffers.get(sender);
+  if (!buf || !buf.text.trim()) {
+    if (buf) {
+      buf.text = '';
+      buf.needsPrefix = true;
+    }
+    return;
+  }
+
+  const textLines = buf.text.split('\n');
+  for (const line of textLines) {
+    if (line.trim()) {
+      lines.push(`${prefix} ${formatMarkdownLine(line)}`);
+    }
+  }
+  buf.text = '';
+  buf.needsPrefix = true;
+}
+
+function flushAllRenderBuffers(lines, buffers) {
+  for (const [sender, buf] of buffers) {
+    if (!buf.text.trim()) continue;
+    const prefix = getRenderPrefix(sender);
+    for (const line of buf.text.split('\n')) {
+      if (line.trim()) {
+        lines.push(`${prefix} ${line}`);
+      }
+    }
+  }
+}
+
+function formatLifecycleEvent(data) {
+  const event = data?.event;
+  let icon;
+  let eventText;
+
+  switch (event) {
+    case 'STARTED': {
+      icon = chalk.green('▶');
+      const triggers = data?.triggers?.join(', ') || 'none';
+      eventText = `started (listening for: ${chalk.dim(triggers)})`;
+      break;
+    }
+    case 'TASK_STARTED':
+      icon = chalk.yellow('⚡');
+      eventText = `${chalk.cyan(data.triggeredBy)} → task #${data.iteration} (${chalk.dim(data.model)})`;
+      break;
+    case 'TASK_COMPLETED':
+      icon = chalk.green('✓');
+      eventText = `task #${data.iteration} completed`;
+      break;
+    default:
+      icon = chalk.dim('•');
+      eventText = event || 'unknown event';
+  }
+
+  return { icon, eventText };
+}
+
+function handleLifecycleRender({ msg, prefix, lines }) {
+  const data = msg.content?.data;
+  const { icon, eventText } = formatLifecycleEvent(data);
+  lines.push(`${prefix} ${icon} ${eventText}`);
+}
+
+function getIssuePreviewLine(text) {
+  if (!text) return '';
+  return text.split('\n').find((line) => line.trim() && line.trim() !== '# Manual Input');
+}
+
+function handleIssueOpenedRender({ msg, prefix, timestamp, lines }) {
+  lines.push('');
+  lines.push(chalk.bold.blue('─'.repeat(80)));
+
+  const issueData = msg.content?.data || {};
+  const issueUrl = issueData.url || issueData.html_url;
+  const issueTitle = issueData.title;
+  const issueNum = issueData.issue_number || issueData.number;
+
+  if (issueUrl) {
+    lines.push(
+      `${prefix} ${chalk.gray(timestamp)} ${chalk.bold.blue('📋')} ${chalk.cyan(issueUrl)}`
+    );
+    if (issueTitle) {
+      lines.push(`${prefix} ${chalk.white(issueTitle)}`);
+    }
+  } else if (issueNum) {
+    lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.blue('📋')} Issue #${issueNum}`);
+    if (issueTitle) {
+      lines.push(`${prefix} ${chalk.white(issueTitle)}`);
+    }
+  } else {
+    lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.blue('📋 TASK')}`);
+    const firstLine = getIssuePreviewLine(msg.content?.text);
+    if (firstLine) {
+      lines.push(`${prefix} ${chalk.white(firstLine.slice(0, 100))}`);
+    }
+  }
+
+  lines.push(chalk.bold.blue('─'.repeat(80)));
+}
+
+function handleImplementationReadyRender({ prefix, timestamp, lines }) {
+  lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.yellow('✅ IMPLEMENTATION READY')}`);
+}
+
+function normalizeIssueList(rawIssues) {
+  if (!rawIssues) return [];
+  if (Array.isArray(rawIssues)) return rawIssues;
+  if (typeof rawIssues === 'string') {
+    try {
+      const parsed = JSON.parse(rawIssues);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function appendCriteriaGroup(lines, prefix, label, items, color, reasonLabel) {
+  if (!items.length) return;
+  lines.push(`${prefix}   ${color(label)} (${items.length} criteria - ${reasonLabel}):`);
+  for (const item of items) {
+    lines.push(`${prefix}     ${color('•')} ${item.id}: ${item.reason || 'No reason provided'}`);
+  }
+}
+
+function appendCriteriaResults(lines, prefix, criteriaResults) {
+  if (!Array.isArray(criteriaResults)) return;
+
+  const cannotValidateYet = criteriaResults.filter((c) => c.status === 'CANNOT_VALIDATE_YET');
+  appendCriteriaGroup(
+    lines,
+    prefix,
+    '❌ Cannot validate yet',
+    cannotValidateYet,
+    chalk.red,
+    'work incomplete'
+  );
+
+  const cannotValidate = criteriaResults.filter((c) => c.status === 'CANNOT_VALIDATE');
+  appendCriteriaGroup(
+    lines,
+    prefix,
+    '⚠️ Could not validate',
+    cannotValidate,
+    chalk.yellow,
+    'permanent'
+  );
+}
+
+function handleValidationResultRender({ msg, prefix, timestamp, lines }) {
+  const data = msg.content?.data || {};
+  const approved = data.approved === true || data.approved === 'true';
+  const icon = approved ? chalk.green('✓ APPROVED') : chalk.red('✗ REJECTED');
+  lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.magenta('VALIDATION_RESULT')}`);
+  lines.push(`${prefix}   ${icon} ${chalk.dim(data.summary || '')}`);
+
+  if (!approved) {
+    const issues = normalizeIssueList(data.issues || data.errors);
+    for (const issue of issues) {
+      lines.push(`${prefix}     ${chalk.red('•')} ${issue}`);
+    }
+  }
+
+  appendCriteriaResults(lines, prefix, data.criteriaResults);
+}
+
+function handlePrCreatedRender({ msg, prefix, timestamp, lines }) {
+  lines.push('');
+  lines.push(chalk.bold.green('─'.repeat(80)));
+  lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.green('🔗 PR CREATED')}`);
+  if (msg.content?.data?.pr_url) {
+    lines.push(`${prefix} ${chalk.cyan(msg.content.data.pr_url)}`);
+  }
+  if (msg.content?.data?.merged) {
+    lines.push(`${prefix} ${chalk.bold.cyan('✓ MERGED')}`);
+  }
+  lines.push(chalk.bold.green('─'.repeat(80)));
+}
+
+function handleClusterCompleteRender({ prefix, timestamp, lines }) {
+  lines.push('');
+  lines.push(chalk.bold.green('─'.repeat(80)));
+  lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.green('✅ CLUSTER COMPLETE')}`);
+  lines.push(chalk.bold.green('─'.repeat(80)));
+}
+
+function handleAgentErrorRender({ msg, prefix, timestamp, lines }) {
+  lines.push('');
+  lines.push(chalk.bold.red('─'.repeat(80)));
+  lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.red('🔴 AGENT ERROR')}`);
+  if (msg.content?.text) {
+    lines.push(`${prefix} ${chalk.red(msg.content.text)}`);
+  }
+  lines.push(chalk.bold.red('─'.repeat(80)));
+}
+
+function appendAgentTextEvent(lines, sender, prefix, buffers, text) {
+  const buf = getRenderBuffer(buffers, sender);
+  buf.text += text;
+
+  while (buf.text.includes('\n')) {
+    const idx = buf.text.indexOf('\n');
+    const line = buf.text.slice(0, idx);
+    buf.text = buf.text.slice(idx + 1);
+    if (line.trim()) {
+      lines.push(`${prefix} ${formatMarkdownLine(line)}`);
+    }
+  }
+}
+
+function appendAgentToolCallEvent(lines, sender, prefix, buffers, toolCalls, event) {
+  flushRenderBuffer(buffers, sender, prefix, lines);
+  const icon = getToolIcon(event.toolName);
+  const toolDesc = formatToolCall(event.toolName, event.input);
+  lines.push(`${prefix} ${icon} ${chalk.cyan(event.toolName)} ${chalk.dim(toolDesc)}`);
+  toolCalls.set(sender, { toolName: event.toolName, input: event.input });
+}
+
+function appendAgentToolResultEvent(lines, sender, prefix, toolCalls, event) {
+  const status = event.isError ? chalk.red('✗') : chalk.green('✓');
+  const toolCall = toolCalls.get(sender);
+  const resultDesc = formatToolResult(
+    event.content,
+    event.isError,
+    toolCall?.toolName,
+    toolCall?.input
+  );
+  lines.push(`${prefix}   ${status} ${resultDesc}`);
+  toolCalls.delete(sender);
+}
+
+function handleAgentOutputRender({ msg, prefix, lines, buffers, toolCalls }) {
+  const content = msg.content?.data?.line || msg.content?.data?.chunk || msg.content?.text;
+  if (!content || !content.trim()) return;
+
+  const provider = normalizeProviderName(
+    msg.content?.data?.provider || msg.sender_provider || 'claude'
+  );
+  const events = parseProviderChunk(provider, content);
+  for (const event of events) {
+    if (event.type === 'text') {
+      appendAgentTextEvent(lines, msg.sender, prefix, buffers, event.text);
+      continue;
+    }
+    if (event.type === 'tool_call') {
+      appendAgentToolCallEvent(lines, msg.sender, prefix, buffers, toolCalls, event);
+      continue;
+    }
+    if (event.type === 'tool_result') {
+      appendAgentToolResultEvent(lines, msg.sender, prefix, toolCalls, event);
+    }
+  }
+}
+
+const RENDER_TOPIC_HANDLERS = {
+  AGENT_LIFECYCLE: handleLifecycleRender,
+  ISSUE_OPENED: handleIssueOpenedRender,
+  IMPLEMENTATION_READY: handleImplementationReadyRender,
+  VALIDATION_RESULT: handleValidationResultRender,
+  PR_CREATED: handlePrCreatedRender,
+  CLUSTER_COMPLETE: handleClusterCompleteRender,
+  AGENT_ERROR: handleAgentErrorRender,
+  AGENT_OUTPUT: handleAgentOutputRender,
+};
+
 /**
  * Render messages to terminal-style output with ANSI colors (same as zeroshot logs)
  */
 function renderMessagesToTerminal(clusterId, messages) {
   const lines = [];
-  const buffers = new Map(); // Line buffers per sender
-  const toolCalls = new Map(); // Track tool calls per sender
-
-  const getBuffer = (sender) => {
-    if (!buffers.has(sender)) {
-      buffers.set(sender, { text: '', needsPrefix: true });
-    }
-    return buffers.get(sender);
-  };
-
-  const flushBuffer = (sender, prefix) => {
-    const buf = buffers.get(sender);
-    if (buf && buf.text.trim()) {
-      const textLines = buf.text.split('\n');
-      for (const line of textLines) {
-        if (line.trim()) {
-          lines.push(`${prefix} ${formatMarkdownLine(line)}`);
-        }
-      }
-      buf.text = '';
-      buf.needsPrefix = true;
-    }
-  };
+  const buffers = new Map();
+  const toolCalls = new Map();
 
   for (const msg of messages) {
-    const timestamp = new Date(msg.timestamp).toLocaleTimeString('en-US', {
-      hour12: false,
-    });
-    const color = getColorForSender(msg.sender);
-    const prefix = color(`${msg.sender.padEnd(15)} |`);
-
-    // AGENT_LIFECYCLE
-    if (msg.topic === 'AGENT_LIFECYCLE') {
-      const data = msg.content?.data;
-      const event = data?.event;
-      let icon, eventText;
-      switch (event) {
-        case 'STARTED':
-          icon = chalk.green('▶');
-          const triggers = data.triggers?.join(', ') || 'none';
-          eventText = `started (listening for: ${chalk.dim(triggers)})`;
-          break;
-        case 'TASK_STARTED':
-          icon = chalk.yellow('⚡');
-          eventText = `${chalk.cyan(data.triggeredBy)} → task #${data.iteration} (${chalk.dim(data.model)})`;
-          break;
-        case 'TASK_COMPLETED':
-          icon = chalk.green('✓');
-          eventText = `task #${data.iteration} completed`;
-          break;
-        default:
-          icon = chalk.dim('•');
-          eventText = event || 'unknown event';
-      }
-      lines.push(`${prefix} ${icon} ${eventText}`);
+    const timestamp = formatLogTimestamp(msg.timestamp);
+    const prefix = getRenderPrefix(msg.sender);
+    const handler = RENDER_TOPIC_HANDLERS[msg.topic];
+    if (handler) {
+      handler({ msg, prefix, timestamp, lines, buffers, toolCalls });
       continue;
     }
 
-    // ISSUE_OPENED
-    if (msg.topic === 'ISSUE_OPENED') {
-      lines.push('');
-      lines.push(chalk.bold.blue('─'.repeat(80)));
-      // Extract issue URL if present
-      const issueData = msg.content?.data || {};
-      const issueUrl = issueData.url || issueData.html_url;
-      const issueTitle = issueData.title;
-      const issueNum = issueData.issue_number || issueData.number;
-
-      if (issueUrl) {
-        lines.push(
-          `${prefix} ${chalk.gray(timestamp)} ${chalk.bold.blue('📋')} ${chalk.cyan(issueUrl)}`
-        );
-        if (issueTitle) {
-          lines.push(`${prefix} ${chalk.white(issueTitle)}`);
-        }
-      } else if (issueNum) {
-        lines.push(
-          `${prefix} ${chalk.gray(timestamp)} ${chalk.bold.blue('📋')} Issue #${issueNum}`
-        );
-        if (issueTitle) {
-          lines.push(`${prefix} ${chalk.white(issueTitle)}`);
-        }
-      } else {
-        // Fallback: show first line of text only
-        lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.blue('📋 TASK')}`);
-        if (msg.content?.text) {
-          const firstLine = msg.content.text
-            .split('\n')
-            .find((l) => l.trim() && l.trim() !== '# Manual Input');
-          if (firstLine) {
-            lines.push(`${prefix} ${chalk.white(firstLine.slice(0, 100))}`);
-          }
-        }
-      }
-      lines.push(chalk.bold.blue('─'.repeat(80)));
-      continue;
-    }
-
-    // IMPLEMENTATION_READY
-    if (msg.topic === 'IMPLEMENTATION_READY') {
-      lines.push(
-        `${prefix} ${chalk.gray(timestamp)} ${chalk.bold.yellow('✅ IMPLEMENTATION READY')}`
-      );
-      continue;
-    }
-
-    // VALIDATION_RESULT
-    if (msg.topic === 'VALIDATION_RESULT') {
-      const data = msg.content?.data || {};
-      const approved = data.approved === true || data.approved === 'true';
-      const icon = approved ? chalk.green('✓ APPROVED') : chalk.red('✗ REJECTED');
-      lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.magenta('VALIDATION_RESULT')}`);
-      lines.push(`${prefix}   ${icon} ${chalk.dim(data.summary || '')}`);
-      if (!approved) {
-        let issues = data.issues || data.errors;
-        if (typeof issues === 'string') {
-          try {
-            issues = JSON.parse(issues);
-          } catch {
-            issues = [];
-          }
-        }
-        if (Array.isArray(issues)) {
-          for (const issue of issues) {
-            lines.push(`${prefix}     ${chalk.red('•')} ${issue}`);
-          }
-        }
-      }
-      // Show CANNOT_VALIDATE (permanent) as warnings, CANNOT_VALIDATE_YET (temporary) as errors
-      const criteriaResults = data.criteriaResults;
-      if (Array.isArray(criteriaResults)) {
-        // CANNOT_VALIDATE_YET = temporary, treated as FAIL (work incomplete)
-        const cannotValidateYet = criteriaResults.filter((c) => c.status === 'CANNOT_VALIDATE_YET');
-        if (cannotValidateYet.length > 0) {
-          lines.push(
-            `${prefix}   ${chalk.red('❌ Cannot validate yet')} (${cannotValidateYet.length} criteria - work incomplete):`
-          );
-          for (const cv of cannotValidateYet) {
-            lines.push(
-              `${prefix}     ${chalk.red('•')} ${cv.id}: ${cv.reason || 'No reason provided'}`
-            );
-          }
-        }
-
-        // CANNOT_VALIDATE = permanent, treated as PASS (environmental limitation)
-        const cannotValidate = criteriaResults.filter((c) => c.status === 'CANNOT_VALIDATE');
-        if (cannotValidate.length > 0) {
-          lines.push(
-            `${prefix}   ${chalk.yellow('⚠️ Could not validate')} (${cannotValidate.length} criteria - permanent):`
-          );
-          for (const cv of cannotValidate) {
-            lines.push(
-              `${prefix}     ${chalk.yellow('•')} ${cv.id}: ${cv.reason || 'No reason provided'}`
-            );
-          }
-        }
-      }
-      continue;
-    }
-
-    // PR_CREATED
-    if (msg.topic === 'PR_CREATED') {
-      lines.push('');
-      lines.push(chalk.bold.green('─'.repeat(80)));
-      lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.green('🔗 PR CREATED')}`);
-      if (msg.content?.data?.pr_url) {
-        lines.push(`${prefix} ${chalk.cyan(msg.content.data.pr_url)}`);
-      }
-      if (msg.content?.data?.merged) {
-        lines.push(`${prefix} ${chalk.bold.cyan('✓ MERGED')}`);
-      }
-      lines.push(chalk.bold.green('─'.repeat(80)));
-      continue;
-    }
-
-    // CLUSTER_COMPLETE
-    if (msg.topic === 'CLUSTER_COMPLETE') {
-      lines.push('');
-      lines.push(chalk.bold.green('─'.repeat(80)));
-      lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.green('✅ CLUSTER COMPLETE')}`);
-      lines.push(chalk.bold.green('─'.repeat(80)));
-      continue;
-    }
-
-    // AGENT_ERROR
-    if (msg.topic === 'AGENT_ERROR') {
-      lines.push('');
-      lines.push(chalk.bold.red('─'.repeat(80)));
-      lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.red('🔴 AGENT ERROR')}`);
-      if (msg.content?.text) {
-        lines.push(`${prefix} ${chalk.red(msg.content.text)}`);
-      }
-      lines.push(chalk.bold.red('─'.repeat(80)));
-      continue;
-    }
-
-    // AGENT_OUTPUT - parse streaming JSON
-    if (msg.topic === 'AGENT_OUTPUT') {
-      const content = msg.content?.data?.line || msg.content?.data?.chunk || msg.content?.text;
-      if (!content || !content.trim()) continue;
-
-      const provider = normalizeProviderName(
-        msg.content?.data?.provider || msg.sender_provider || 'claude'
-      );
-      const events = parseProviderChunk(provider, content);
-      for (const event of events) {
-        switch (event.type) {
-          case 'text':
-            const buf = getBuffer(msg.sender);
-            buf.text += event.text;
-            // Print complete lines
-            while (buf.text.includes('\n')) {
-              const idx = buf.text.indexOf('\n');
-              const line = buf.text.slice(0, idx);
-              buf.text = buf.text.slice(idx + 1);
-              if (line.trim()) {
-                lines.push(`${prefix} ${formatMarkdownLine(line)}`);
-              }
-            }
-            break;
-          case 'tool_call':
-            flushBuffer(msg.sender, prefix);
-            const icon = getToolIcon(event.toolName);
-            const toolDesc = formatToolCall(event.toolName, event.input);
-            lines.push(`${prefix} ${icon} ${chalk.cyan(event.toolName)} ${chalk.dim(toolDesc)}`);
-            toolCalls.set(msg.sender, {
-              toolName: event.toolName,
-              input: event.input,
-            });
-            break;
-          case 'tool_result':
-            const status = event.isError ? chalk.red('✗') : chalk.green('✓');
-            const tc = toolCalls.get(msg.sender);
-            const resultDesc = formatToolResult(
-              event.content,
-              event.isError,
-              tc?.toolName,
-              tc?.input
-            );
-            lines.push(`${prefix}   ${status} ${resultDesc}`);
-            toolCalls.delete(msg.sender);
-            break;
-        }
-      }
-      continue;
-    }
-
-    // Other topics - show topic name
-    if (msg.topic && !['AGENT_OUTPUT', 'AGENT_LIFECYCLE'].includes(msg.topic)) {
+    if (msg.topic) {
       lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.yellow(msg.topic)}`);
     }
   }
 
-  // Flush any remaining buffers
-  for (const [sender, buf] of buffers) {
-    if (buf.text.trim()) {
-      const color = getColorForSender(sender);
-      const prefix = color(`${sender.padEnd(15)} |`);
-      for (const line of buf.text.split('\n')) {
-        if (line.trim()) {
-          lines.push(`${prefix} ${line}`);
-        }
-      }
-    }
-  }
+  flushAllRenderBuffers(lines, buffers);
 
   return lines.join('\n');
 }
