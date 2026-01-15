@@ -188,6 +188,488 @@ function parseMountSpecs(specs) {
   });
 }
 
+function normalizeRunOptions(options) {
+  if (options.ship) {
+    options.pr = true;
+    if (!options.docker) {
+      options.worktree = true;
+    }
+  }
+  if (options.pr && !options.docker && !options.worktree) {
+    options.worktree = true;
+  }
+  if (options.docker) {
+    options.worktree = false;
+  }
+}
+
+function detectRunInput(inputArg) {
+  const input = {};
+  if (inputArg.match(/^https?:\/\/github\.com\/[\w-]+\/[\w-]+\/issues\/\d+/)) {
+    input.issue = inputArg;
+  } else if (/^\d+$/.test(inputArg)) {
+    input.issue = inputArg;
+  } else if (inputArg.match(/^[\w-]+\/[\w-]+#\d+$/)) {
+    input.issue = inputArg;
+  } else if (/\.(md|markdown)$/i.test(inputArg)) {
+    input.file = inputArg;
+  } else {
+    input.text = inputArg;
+  }
+  return input;
+}
+
+function resolveProviderOverride(options, settings) {
+  return normalizeProviderName(
+    options.provider || process.env.ZEROSHOT_PROVIDER || settings.defaultProvider
+  );
+}
+
+function runClusterPreflight({ input, options, providerOverride }) {
+  requirePreflight({
+    requireGh: !!input.issue,
+    requireDocker: options.docker,
+    requireGit: options.worktree,
+    quiet: process.env.ZEROSHOT_DAEMON === '1',
+    provider: providerOverride,
+  });
+}
+
+function shouldRunDetached(options) {
+  return options.detach && !process.env.ZEROSHOT_DAEMON;
+}
+
+function printDetachedClusterStart(options, clusterId) {
+  if (options.docker) {
+    console.log(`Started ${clusterId} (docker)`);
+  } else {
+    console.log(`Started ${clusterId}`);
+  }
+  console.log(`Monitor: zeroshot logs ${clusterId} -f`);
+  console.log(`Attach:  zeroshot attach ${clusterId}`);
+}
+
+function createDaemonLogFile(clusterId) {
+  const storageDir = path.join(os.homedir(), '.zeroshot');
+  if (!fs.existsSync(storageDir)) {
+    fs.mkdirSync(storageDir, { recursive: true });
+  }
+  const logPath = path.join(storageDir, `${clusterId}-daemon.log`);
+  return fs.openSync(logPath, 'w');
+}
+
+function buildDaemonEnv(options, clusterId, targetCwd) {
+  return {
+    ...process.env,
+    ZEROSHOT_DAEMON: '1',
+    ZEROSHOT_CLUSTER_ID: clusterId,
+    ZEROSHOT_DOCKER: options.docker ? '1' : '',
+    ZEROSHOT_DOCKER_IMAGE: options.dockerImage || '',
+    ZEROSHOT_PR: options.pr ? '1' : '',
+    ZEROSHOT_WORKTREE: options.worktree ? '1' : '',
+    ZEROSHOT_WORKERS: options.workers?.toString() || '',
+    ZEROSHOT_MODEL: options.model || '',
+    ZEROSHOT_PROVIDER: options.provider || '',
+    ZEROSHOT_CWD: targetCwd,
+  };
+}
+
+function spawnDetachedCluster(options, clusterId) {
+  const { spawn } = require('child_process');
+  printDetachedClusterStart(options, clusterId);
+  const logFd = createDaemonLogFile(clusterId);
+  const targetCwd = detectGitRepoRoot();
+  const daemon = spawn(process.execPath, process.argv.slice(1), {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    cwd: targetCwd,
+    env: buildDaemonEnv(options, clusterId, targetCwd),
+  });
+  daemon.unref();
+  fs.closeSync(logFd);
+}
+
+function resolveClusterId(generateName) {
+  const clusterId = process.env.ZEROSHOT_CLUSTER_ID || generateName('cluster');
+  process.env.ZEROSHOT_CLUSTER_ID = clusterId;
+  return clusterId;
+}
+
+function resolveConfigName(options, settings) {
+  return options.config || settings.defaultConfig;
+}
+
+function resolveConfigPath(configName) {
+  if (path.isAbsolute(configName) || configName.startsWith('./') || configName.startsWith('../')) {
+    return path.resolve(process.cwd(), configName);
+  }
+  if (configName.endsWith('.json')) {
+    return path.join(PACKAGE_ROOT, 'cluster-templates', configName);
+  }
+  return path.join(PACKAGE_ROOT, 'cluster-templates', `${configName}.json`);
+}
+
+function ensureConfigProviderDefaults(config, settings) {
+  if (!config.defaultProvider) {
+    config.defaultProvider = settings.defaultProvider || 'claude';
+  }
+  config.defaultProvider = normalizeProviderName(config.defaultProvider) || 'claude';
+}
+
+function applyProviderOverrideToConfig(config, providerOverride, settings) {
+  const provider = getProvider(providerOverride);
+  const providerSettings = settings.providerSettings?.[providerOverride] || {};
+  config.forceProvider = providerOverride;
+  config.defaultProvider = providerOverride;
+  config.forceLevel = providerSettings.defaultLevel || provider.getDefaultLevel();
+  config.defaultLevel = config.forceLevel;
+  console.log(chalk.dim(`Provider override: ${providerOverride} (all agents)`));
+}
+
+function loadClusterConfig(orchestrator, configPath, settings, providerOverride) {
+  const config = orchestrator.loadConfig(configPath);
+  ensureConfigProviderDefaults(config, settings);
+  if (providerOverride) {
+    applyProviderOverrideToConfig(config, providerOverride, settings);
+  }
+  return config;
+}
+
+function trackActiveCluster(clusterId, orchestrator) {
+  activeClusterId = clusterId;
+  orchestratorInstance = orchestrator;
+}
+
+function printForegroundStartInfo(options, clusterId, configName) {
+  if (process.env.ZEROSHOT_DAEMON) {
+    return;
+  }
+  if (options.docker) {
+    console.log(`Starting ${clusterId} (docker)`);
+  } else if (options.worktree) {
+    console.log(`Starting ${clusterId} (worktree)`);
+  } else {
+    console.log(`Starting ${clusterId}`);
+  }
+  console.log(chalk.dim(`Config: ${configName}`));
+  console.log(chalk.dim('Ctrl+C to stop following (cluster keeps running)\n'));
+}
+
+function resolveStrictSchema(options, settings) {
+  return (
+    options.strictSchema || process.env.ZEROSHOT_STRICT_SCHEMA === '1' || settings.strictSchema
+  );
+}
+
+function applyStrictSchema(config, strictSchema) {
+  if (!strictSchema) {
+    return;
+  }
+  for (const agent of config.agents) {
+    agent.strictSchema = true;
+  }
+}
+
+function resolveModelOverride(options) {
+  return options.model || process.env.ZEROSHOT_MODEL;
+}
+
+function applyModelOverrideToConfig(config, modelOverride, providerOverride, settings) {
+  if (!modelOverride) {
+    return;
+  }
+
+  const providerName = normalizeProviderName(
+    providerOverride || config.defaultProvider || settings.defaultProvider || 'claude'
+  );
+  const provider = getProvider(providerName);
+  const catalog = provider.getModelCatalog();
+
+  if (catalog && !catalog[modelOverride]) {
+    console.warn(
+      chalk.yellow(
+        `Warning: model override "${modelOverride}" is not in the ${providerName} catalog`
+      )
+    );
+  }
+
+  if (providerName === 'claude' && ['opus', 'sonnet', 'haiku'].includes(modelOverride)) {
+    const { validateModelAgainstMax } = require('../lib/settings');
+    try {
+      validateModelAgainstMax(modelOverride, settings.maxModel);
+    } catch (err) {
+      console.error(chalk.red(`Error: ${err.message}`));
+      process.exit(1);
+    }
+  }
+
+  for (const agent of config.agents) {
+    agent.model = modelOverride;
+    if (agent.modelRules) {
+      delete agent.modelRules;
+    }
+  }
+  console.log(chalk.dim(`Model override: ${modelOverride} (all agents)`));
+}
+
+function buildStartOptions({ clusterId, options, settings, providerOverride, modelOverride }) {
+  const targetCwd = process.env.ZEROSHOT_CWD || detectGitRepoRoot();
+  return {
+    clusterId,
+    cwd: targetCwd,
+    isolation: options.docker || process.env.ZEROSHOT_DOCKER === '1' || settings.defaultDocker,
+    isolationImage: options.dockerImage || process.env.ZEROSHOT_DOCKER_IMAGE || undefined,
+    worktree: options.worktree || process.env.ZEROSHOT_WORKTREE === '1',
+    autoPr: options.pr || process.env.ZEROSHOT_PR === '1',
+    autoMerge: process.env.ZEROSHOT_MERGE === '1',
+    autoPush: process.env.ZEROSHOT_PUSH === '1',
+    modelOverride: modelOverride || undefined,
+    providerOverride: providerOverride || undefined,
+    noMounts: options.noMounts || false,
+    mounts: options.mount ? parseMountSpecs(options.mount) : undefined,
+    containerHome: options.containerHome || undefined,
+  };
+}
+
+function createStatusFooter(clusterId, messageBus) {
+  const statusFooter = new StatusFooter({
+    refreshInterval: 1000,
+    enabled: process.stdout.isTTY,
+  });
+  statusFooter.setCluster(clusterId);
+  statusFooter.setClusterState('running');
+  statusFooter.setMessageBus(messageBus);
+  activeStatusFooter = statusFooter;
+  return statusFooter;
+}
+
+function createLifecycleHandler(statusFooter) {
+  return (msg) => {
+    const data = msg.content?.data || {};
+    const event = data.event;
+    const agentId = data.agent || msg.sender;
+
+    if (event === 'STARTED') {
+      statusFooter.updateAgent({
+        id: agentId,
+        state: AGENT_STATE.IDLE,
+        pid: null,
+        iteration: data.iteration || 0,
+      });
+      return;
+    }
+
+    if (event === 'TASK_STARTED') {
+      statusFooter.updateAgent({
+        id: agentId,
+        state: AGENT_STATE.EXECUTING_TASK,
+        pid: statusFooter.agents.get(agentId)?.pid || null,
+        iteration: data.iteration || 0,
+      });
+      return;
+    }
+
+    if (event === 'PROCESS_SPAWNED') {
+      const current = statusFooter.agents.get(agentId) || { iteration: 0 };
+      statusFooter.updateAgent({
+        id: agentId,
+        state: AGENT_STATE.EXECUTING_TASK,
+        pid: data.pid,
+        iteration: current.iteration,
+      });
+      return;
+    }
+
+    if (event === 'TASK_COMPLETED' || event === 'TASK_FAILED') {
+      statusFooter.updateAgent({
+        id: agentId,
+        state: AGENT_STATE.IDLE,
+        pid: null,
+        iteration: data.iteration || 0,
+      });
+      return;
+    }
+
+    if (event === 'STOPPED') {
+      statusFooter.removeAgent(agentId);
+    }
+  };
+}
+
+function replayLifecycleMessages(cluster, clusterId, handler) {
+  const historicalLifecycle = cluster.messageBus
+    .getAll(clusterId)
+    .filter((msg) => msg.topic === 'AGENT_LIFECYCLE');
+  for (const msg of historicalLifecycle) {
+    handler(msg);
+  }
+}
+
+function createClusterMessageHandler(clusterId, processedMessageIds, sendersWithOutput) {
+  return (msg) => {
+    if (msg.cluster_id !== clusterId) return;
+    if (processedMessageIds.has(msg.id)) return;
+    processedMessageIds.add(msg.id);
+
+    if (msg.topic === 'AGENT_OUTPUT' && msg.sender) {
+      sendersWithOutput.add(msg.sender);
+    }
+    printMessage(msg, false, false, true);
+  };
+}
+
+function replayClusterMessages(cluster, clusterId, handler) {
+  const historicalMessages = cluster.messageBus.getAll(clusterId);
+  for (const msg of historicalMessages) {
+    handler(msg);
+  }
+}
+
+function flushForegroundSenders(sendersWithOutput) {
+  for (const sender of sendersWithOutput) {
+    const prefix = getColorForSender(sender)(`${sender.padEnd(15)} |`);
+    flushLineBuffer(prefix, sender);
+  }
+}
+
+function createForegroundCleanup({
+  statusFooter,
+  lifecycleUnsubscribe,
+  unsubscribe,
+  flushInterval,
+  sendersWithOutput,
+}) {
+  const stop = () => {
+    clearInterval(flushInterval);
+    lifecycleUnsubscribe();
+    unsubscribe();
+    statusFooter.stop();
+    activeStatusFooter = null;
+  };
+
+  const stopWithFlush = () => {
+    flushForegroundSenders(sendersWithOutput);
+    stop();
+  };
+
+  return { stop, stopWithFlush };
+}
+
+function setupForegroundSigintHandler({ orchestrator, clusterId, cleanup, stopChecking }) {
+  const handler = async () => {
+    cleanup.stop();
+    stopChecking();
+    console.log(chalk.dim('\n\n--- Interrupted ---'));
+
+    try {
+      console.log(chalk.dim(`Stopping cluster ${clusterId}...`));
+      await orchestrator.stop(clusterId);
+      console.log(chalk.dim(`Cluster ${clusterId} stopped.`));
+    } catch (stopErr) {
+      console.error(chalk.red(`Failed to stop cluster: ${stopErr.message}`));
+    }
+
+    process.exit(0);
+  };
+
+  process.on('SIGINT', handler);
+  return () => {
+    process.off('SIGINT', handler);
+  };
+}
+
+function waitForClusterCompletion(orchestrator, clusterId, cleanup) {
+  return new Promise((resolve) => {
+    let checkInterval;
+    const stopChecking = () => {
+      if (checkInterval) {
+        clearInterval(checkInterval);
+      }
+    };
+    const removeSigint = setupForegroundSigintHandler({
+      orchestrator,
+      clusterId,
+      cleanup,
+      stopChecking,
+    });
+
+    const finish = (finalizer) => {
+      stopChecking();
+      removeSigint();
+      finalizer();
+      resolve();
+    };
+
+    checkInterval = setInterval(() => {
+      try {
+        const status = orchestrator.getStatus(clusterId);
+        if (status.state !== 'running') {
+          finish(cleanup.stopWithFlush);
+        }
+      } catch {
+        finish(cleanup.stop);
+      }
+    }, 500);
+  });
+}
+
+async function streamClusterInForeground(cluster, orchestrator, clusterId) {
+  const sendersWithOutput = new Set();
+  const processedMessageIds = new Set();
+
+  const statusFooter = createStatusFooter(clusterId, cluster.messageBus);
+  const handleLifecycleMessage = createLifecycleHandler(statusFooter);
+  const lifecycleUnsubscribe = cluster.messageBus.subscribeTopic(
+    'AGENT_LIFECYCLE',
+    handleLifecycleMessage
+  );
+  replayLifecycleMessages(cluster, clusterId, handleLifecycleMessage);
+  statusFooter.start();
+
+  const handleMessage = createClusterMessageHandler(
+    clusterId,
+    processedMessageIds,
+    sendersWithOutput
+  );
+  const unsubscribe = cluster.messageBus.subscribe(handleMessage);
+  replayClusterMessages(cluster, clusterId, handleMessage);
+
+  const flushInterval = setInterval(() => {
+    flushForegroundSenders(sendersWithOutput);
+  }, 250);
+
+  const cleanup = createForegroundCleanup({
+    statusFooter,
+    lifecycleUnsubscribe,
+    unsubscribe,
+    flushInterval,
+    sendersWithOutput,
+  });
+
+  await waitForClusterCompletion(orchestrator, clusterId, cleanup);
+  console.log(chalk.dim(`\nCluster ${clusterId} completed.`));
+}
+
+function setupDaemonCleanup(orchestrator, clusterId) {
+  if (!process.env.ZEROSHOT_DAEMON) {
+    return;
+  }
+
+  const cleanup = async (signal) => {
+    console.log(`\n[DAEMON] Received ${signal}, cleaning up cluster ${clusterId}...`);
+    try {
+      await orchestrator.stop(clusterId);
+      console.log(`[DAEMON] Cluster ${clusterId} stopped.`);
+    } catch (e) {
+      console.error(`[DAEMON] Cleanup error: ${e.message}`);
+    }
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => cleanup('SIGTERM'));
+  process.on('SIGINT', () => cleanup('SIGINT'));
+}
+
 // Lazy-loaded orchestrator (quiet by default) - created on first use
 /** @type {import('../src/orchestrator') | null} */
 let _orchestrator = null;
@@ -551,450 +1033,53 @@ Input formats:
   )
   .action(async (inputArg, options) => {
     try {
-      // Cascading flag implications: --ship → --pr → worktree (unless --docker)
-      // --ship = full automation (worktree isolation + PR + auto-merge)
-      if (options.ship) {
-        options.pr = true;
-        // Use worktree by default, Docker only if explicitly requested
-        if (!options.docker) {
-          options.worktree = true;
-        }
-      }
-      // --pr = PR for human review (worktree by default, Docker if requested)
-      if (options.pr && !options.docker && !options.worktree) {
-        options.worktree = true;
-      }
-
-      // Mutual exclusivity: --docker explicitly disables worktree
-      if (options.docker) {
-        options.worktree = false;
-      }
-
-      // Auto-detect input type
-      let input = {};
-
-      // Check if it's a GitHub issue URL
-      if (inputArg.match(/^https?:\/\/github\.com\/[\w-]+\/[\w-]+\/issues\/\d+/)) {
-        input.issue = inputArg;
-      }
-      // Check if it's a GitHub issue number (just digits)
-      else if (/^\d+$/.test(inputArg)) {
-        input.issue = inputArg;
-      }
-      // Check if it's org/repo#123 format
-      else if (inputArg.match(/^[\w-]+\/[\w-]+#\d+$/)) {
-        input.issue = inputArg;
-      }
-      // Check if it's a markdown file (.md or .markdown)
-      else if (/\.(md|markdown)$/i.test(inputArg)) {
-        input.file = inputArg;
-      }
-      // Otherwise, treat as plain text
-      else {
-        input.text = inputArg;
-      }
-
-      // === PREFLIGHT CHECKS ===
-      // Validate all dependencies BEFORE starting anything
-      // This gives users clear, actionable error messages upfront
+      normalizeRunOptions(options);
+      const input = detectRunInput(inputArg);
       const settings = loadSettings();
-      const providerOverride = normalizeProviderName(
-        options.provider || process.env.ZEROSHOT_PROVIDER || settings.defaultProvider
-      );
-      const preflightOptions = {
-        requireGh: !!input.issue, // gh CLI required when fetching GitHub issues
-        requireDocker: options.docker, // Docker required for --docker mode
-        requireGit: options.worktree, // Git required for worktree isolation
-        quiet: process.env.ZEROSHOT_DAEMON === '1', // Suppress success in daemon mode
-        provider: providerOverride,
-      };
-      requirePreflight(preflightOptions);
-
-      // === CLUSTER MODE ===
+      const providerOverride = resolveProviderOverride(options, settings);
+      runClusterPreflight({ input, options, providerOverride });
 
       const { generateName } = require('../src/name-generator');
 
-      // === DETACHED MODE (-d flag) ===
-      // Spawn daemon and exit immediately
-      if (options.detach && !process.env.ZEROSHOT_DAEMON) {
-        const { spawn } = require('child_process');
-
-        // Generate cluster ID in parent so we can display it
+      if (shouldRunDetached(options)) {
         const clusterId = generateName('cluster');
-
-        // Output cluster ID and help
-        if (options.docker) {
-          console.log(`Started ${clusterId} (docker)`);
-        } else {
-          console.log(`Started ${clusterId}`);
-        }
-        console.log(`Monitor: zeroshot logs ${clusterId} -f`);
-        console.log(`Attach:  zeroshot attach ${clusterId}`);
-
-        // Create log file for daemon output (captures startup errors)
-        const osModule = require('os');
-        const storageDir = path.join(osModule.homedir(), '.zeroshot');
-        if (!fs.existsSync(storageDir)) {
-          fs.mkdirSync(storageDir, { recursive: true });
-        }
-        const logPath = path.join(storageDir, `${clusterId}-daemon.log`);
-        const logFd = fs.openSync(logPath, 'w');
-
-        // Detect git repo root for CWD propagation
-        // CRITICAL: Agents must work in the target repo, not where CLI was invoked
-        const targetCwd = detectGitRepoRoot();
-
-        // Spawn ourselves as daemon (detached, logs to file)
-        const daemon = spawn(process.execPath, process.argv.slice(1), {
-          detached: true,
-          stdio: ['ignore', logFd, logFd], // stdout + stderr go to log file
-          cwd: targetCwd, // Daemon inherits correct working directory
-          env: {
-            ...process.env,
-            ZEROSHOT_DAEMON: '1',
-            ZEROSHOT_CLUSTER_ID: clusterId,
-            ZEROSHOT_DOCKER: options.docker ? '1' : '',
-            ZEROSHOT_DOCKER_IMAGE: options.dockerImage || '',
-            ZEROSHOT_PR: options.pr ? '1' : '',
-            ZEROSHOT_WORKTREE: options.worktree ? '1' : '',
-            ZEROSHOT_WORKERS: options.workers?.toString() || '',
-            ZEROSHOT_MODEL: options.model || '',
-            ZEROSHOT_PROVIDER: options.provider || '',
-            ZEROSHOT_CWD: targetCwd, // Explicit CWD for orchestrator
-          },
-        });
-
-        daemon.unref();
-        fs.closeSync(logFd);
-        process.exit(0);
+        spawnDetachedCluster(options, clusterId);
+        return;
       }
 
-      // === FOREGROUND MODE (default) or DAEMON CHILD ===
-
-      // Use cluster ID from env (daemon mode) or generate new one (foreground mode)
-      // IMPORTANT: Set env var so orchestrator picks it up
-      const clusterId = process.env.ZEROSHOT_CLUSTER_ID || generateName('cluster');
-      process.env.ZEROSHOT_CLUSTER_ID = clusterId;
+      const clusterId = resolveClusterId(generateName);
 
       // === LOAD CONFIG ===
       // Priority: CLI --config > settings.defaultConfig
-      let config;
-      const configName = options.config || settings.defaultConfig;
-
-      // Resolve config path (check examples/ directory if not absolute/relative path)
-      let configPath;
-      if (
-        path.isAbsolute(configName) ||
-        configName.startsWith('./') ||
-        configName.startsWith('../')
-      ) {
-        configPath = path.resolve(process.cwd(), configName);
-      } else if (configName.endsWith('.json')) {
-        // If it has .json extension, check examples/ directory
-        configPath = path.join(PACKAGE_ROOT, 'cluster-templates', configName);
-      } else {
-        // Otherwise assume it's a template name (add .json)
-        configPath = path.join(PACKAGE_ROOT, 'cluster-templates', `${configName}.json`);
-      }
-
-      // Create orchestrator with clusterId override for foreground mode
+      const configName = resolveConfigName(options, settings);
+      const configPath = resolveConfigPath(configName);
       const orchestrator = await getOrchestrator();
-      config = orchestrator.loadConfig(configPath);
+      const config = loadClusterConfig(orchestrator, configPath, settings, providerOverride);
+      trackActiveCluster(clusterId, orchestrator);
+      printForegroundStartInfo(options, clusterId, configName);
 
-      if (!config.defaultProvider) {
-        config.defaultProvider = settings.defaultProvider || 'claude';
-      }
-      config.defaultProvider = normalizeProviderName(config.defaultProvider) || 'claude';
+      const strictSchema = resolveStrictSchema(options, settings);
+      applyStrictSchema(config, strictSchema);
 
-      if (providerOverride) {
-        const provider = getProvider(providerOverride);
-        const providerSettings = settings.providerSettings?.[providerOverride] || {};
-        config.forceProvider = providerOverride;
-        config.defaultProvider = providerOverride;
-        config.forceLevel = providerSettings.defaultLevel || provider.getDefaultLevel();
-        config.defaultLevel = config.forceLevel;
-        console.log(chalk.dim(`Provider override: ${providerOverride} (all agents)`));
-      }
+      const modelOverride = resolveModelOverride(options);
+      applyModelOverrideToConfig(config, modelOverride, providerOverride, settings);
 
-      // Track for global error handler cleanup
-      activeClusterId = clusterId;
-      orchestratorInstance = orchestrator;
-
-      // In foreground mode, show startup info
-      if (!process.env.ZEROSHOT_DAEMON) {
-        if (options.docker) {
-          console.log(`Starting ${clusterId} (docker)`);
-        } else if (options.worktree) {
-          console.log(`Starting ${clusterId} (worktree)`);
-        } else {
-          console.log(`Starting ${clusterId}`);
-        }
-        console.log(chalk.dim(`Config: ${configName}`));
-        console.log(chalk.dim('Ctrl+C to stop following (cluster keeps running)\n'));
-      }
-
-      // Apply strictSchema setting to all agents (CLI > env > settings)
-      const strictSchema =
-        options.strictSchema || process.env.ZEROSHOT_STRICT_SCHEMA === '1' || settings.strictSchema;
-      if (strictSchema) {
-        for (const agent of config.agents) {
-          agent.strictSchema = true;
-        }
-      }
-
-      // Apply model override to all agents (CLI > env)
-      const modelOverride = options.model || process.env.ZEROSHOT_MODEL;
-      if (modelOverride) {
-        const providerName = normalizeProviderName(
-          providerOverride || config.defaultProvider || settings.defaultProvider || 'claude'
-        );
-        const provider = getProvider(providerName);
-        const catalog = provider.getModelCatalog();
-
-        if (catalog && !catalog[modelOverride]) {
-          console.warn(
-            chalk.yellow(
-              `Warning: model override "${modelOverride}" is not in the ${providerName} catalog`
-            )
-          );
-        }
-
-        if (providerName === 'claude' && ['opus', 'sonnet', 'haiku'].includes(modelOverride)) {
-          const { validateModelAgainstMax } = require('../lib/settings');
-          try {
-            validateModelAgainstMax(modelOverride, settings.maxModel);
-          } catch (err) {
-            console.error(chalk.red(`Error: ${err.message}`));
-            process.exit(1);
-          }
-        }
-
-        // Override all agent models
-        for (const agent of config.agents) {
-          agent.model = modelOverride;
-          if (agent.modelRules) {
-            delete agent.modelRules;
-          }
-        }
-        console.log(chalk.dim(`Model override: ${modelOverride} (all agents)`));
-      }
-
-      // Build start options (CLI flags > env vars > settings)
-      // In foreground mode, use CLI options directly; in daemon mode, use env vars
-      // CRITICAL: cwd must be passed to orchestrator for agent CWD propagation
-      const targetCwd = process.env.ZEROSHOT_CWD || detectGitRepoRoot();
-      const startOptions = {
+      const startOptions = buildStartOptions({
         clusterId,
-        cwd: targetCwd, // Target working directory for agents
-        isolation: options.docker || process.env.ZEROSHOT_DOCKER === '1' || settings.defaultDocker,
-        isolationImage: options.dockerImage || process.env.ZEROSHOT_DOCKER_IMAGE || undefined,
-        worktree: options.worktree || process.env.ZEROSHOT_WORKTREE === '1',
-        autoPr: options.pr || process.env.ZEROSHOT_PR === '1',
-        autoMerge: process.env.ZEROSHOT_MERGE === '1',
-        autoPush: process.env.ZEROSHOT_PUSH === '1',
-        // Model override (for dynamically added agents)
-        modelOverride: modelOverride || undefined,
-        providerOverride: providerOverride || undefined,
-        // Docker mount options
-        noMounts: options.noMounts || false,
-        mounts: options.mount ? parseMountSpecs(options.mount) : undefined,
-        containerHome: options.containerHome || undefined,
-      };
+        options,
+        settings,
+        providerOverride,
+        modelOverride,
+      });
 
       // Start cluster
       const cluster = await orchestrator.start(config, input, startOptions);
 
-      // === FOREGROUND MODE: Stream logs in real-time ===
-      // Subscribe to message bus directly (same process) for instant output
       if (!process.env.ZEROSHOT_DAEMON) {
-        // Track senders that have output (for periodic flushing)
-        const sendersWithOutput = new Set();
-        // Track messages we've already processed (to avoid duplicates between history and subscription)
-        const processedMessageIds = new Set();
-
-        // === STATUS FOOTER: Live agent monitoring ===
-        // Shows CPU, memory, network metrics for all agents at bottom of terminal
-        const statusFooter = new StatusFooter({
-          refreshInterval: 1000,
-          enabled: process.stdout.isTTY,
-        });
-        statusFooter.setCluster(clusterId);
-        statusFooter.setClusterState('running');
-        statusFooter.setMessageBus(cluster.messageBus);
-        // Set module-level reference so safePrint/safeWrite route through footer
-        activeStatusFooter = statusFooter;
-
-        // Handler for AGENT_LIFECYCLE messages (extracted for replay)
-        const handleLifecycleMessage = (msg) => {
-          const data = msg.content?.data || {};
-          const event = data.event;
-          const agentId = data.agent || msg.sender;
-
-          // Update agent state based on lifecycle event
-          if (event === 'STARTED') {
-            statusFooter.updateAgent({
-              id: agentId,
-              state: AGENT_STATE.IDLE,
-              pid: null,
-              iteration: data.iteration || 0,
-            });
-          } else if (event === 'TASK_STARTED') {
-            statusFooter.updateAgent({
-              id: agentId,
-              state: AGENT_STATE.EXECUTING_TASK,
-              pid: statusFooter.agents.get(agentId)?.pid || null,
-              iteration: data.iteration || 0,
-            });
-          } else if (event === 'PROCESS_SPAWNED') {
-            // PROCESS_SPAWNED = proof of execution. If a process spawned, agent is executing.
-            const current = statusFooter.agents.get(agentId) || { iteration: 0 };
-            statusFooter.updateAgent({
-              id: agentId,
-              state: AGENT_STATE.EXECUTING_TASK,
-              pid: data.pid,
-              iteration: current.iteration,
-            });
-          } else if (event === 'TASK_COMPLETED' || event === 'TASK_FAILED') {
-            statusFooter.updateAgent({
-              id: agentId,
-              state: AGENT_STATE.IDLE,
-              pid: null,
-              iteration: data.iteration || 0,
-            });
-          } else if (event === 'STOPPED') {
-            statusFooter.removeAgent(agentId);
-          }
-        };
-
-        // Subscribe to AGENT_LIFECYCLE to track agent states and PIDs
-        const lifecycleUnsubscribe = cluster.messageBus.subscribeTopic(
-          'AGENT_LIFECYCLE',
-          handleLifecycleMessage
-        );
-
-        // CRITICAL: Replay historical lifecycle messages that may have been published
-        // BEFORE we subscribed. This fixes the race condition where PROCESS_SPAWNED
-        // fires during orchestrator.start() but subscription happens after.
-        const historicalLifecycle = cluster.messageBus
-          .getAll(clusterId)
-          .filter((msg) => msg.topic === 'AGENT_LIFECYCLE');
-        for (const msg of historicalLifecycle) {
-          handleLifecycleMessage(msg);
-        }
-
-        // Start the status footer
-        statusFooter.start();
-
-        // Message handler - processes messages, deduplicates by ID
-        const handleMessage = (msg) => {
-          if (msg.cluster_id !== clusterId) return;
-          if (processedMessageIds.has(msg.id)) return;
-          processedMessageIds.add(msg.id);
-
-          if (msg.topic === 'AGENT_OUTPUT' && msg.sender) {
-            sendersWithOutput.add(msg.sender);
-          }
-          printMessage(msg, false, false, true);
-        };
-
-        // Subscribe to NEW messages
-        const unsubscribe = cluster.messageBus.subscribe(handleMessage);
-
-        // CRITICAL: Replay historical messages that may have been published BEFORE we subscribed
-        // This fixes the race condition where fast-completing clusters miss output
-        const historicalMessages = cluster.messageBus.getAll(clusterId);
-        for (const msg of historicalMessages) {
-          handleMessage(msg);
-        }
-
-        // Periodic flush of text buffers (streaming text may not have newlines)
-        const flushInterval = setInterval(() => {
-          for (const sender of sendersWithOutput) {
-            const prefix = getColorForSender(sender)(`${sender.padEnd(15)} |`);
-            flushLineBuffer(prefix, sender);
-          }
-        }, 250);
-
-        // Wait for cluster to complete
-        await new Promise((resolve) => {
-          const checkInterval = setInterval(() => {
-            try {
-              const status = orchestrator.getStatus(clusterId);
-              if (status.state !== 'running') {
-                clearInterval(checkInterval);
-                clearInterval(flushInterval);
-                lifecycleUnsubscribe();
-                // Final flush BEFORE stopping status footer
-                // (statusFooter.stop() sends ANSI codes that can clear terminal area)
-                for (const sender of sendersWithOutput) {
-                  const prefix = getColorForSender(sender)(`${sender.padEnd(15)} |`);
-                  flushLineBuffer(prefix, sender);
-                }
-                // Stop status footer AFTER output is done
-                statusFooter.stop();
-                activeStatusFooter = null;
-                unsubscribe();
-                resolve();
-              }
-            } catch {
-              // Cluster may have been removed
-              clearInterval(checkInterval);
-              clearInterval(flushInterval);
-              statusFooter.stop();
-              activeStatusFooter = null;
-              lifecycleUnsubscribe();
-              unsubscribe();
-              resolve();
-            }
-          }, 500);
-
-          // Handle Ctrl+C: Stop cluster since foreground mode has no daemon
-          // CRITICAL: In foreground mode, the cluster runs IN this process.
-          // If we exit without stopping, the cluster becomes a zombie (state=running but no process).
-          process.on('SIGINT', async () => {
-            // Stop status footer first to restore terminal
-            statusFooter.stop();
-            activeStatusFooter = null;
-            lifecycleUnsubscribe();
-
-            console.log(chalk.dim('\n\n--- Interrupted ---'));
-            clearInterval(checkInterval);
-            clearInterval(flushInterval);
-            unsubscribe();
-
-            // Stop the cluster properly so state is updated
-            try {
-              console.log(chalk.dim(`Stopping cluster ${clusterId}...`));
-              await orchestrator.stop(clusterId);
-              console.log(chalk.dim(`Cluster ${clusterId} stopped.`));
-            } catch (stopErr) {
-              console.error(chalk.red(`Failed to stop cluster: ${stopErr.message}`));
-            }
-
-            process.exit(0);
-          });
-        });
-
-        console.log(chalk.dim(`\nCluster ${clusterId} completed.`));
+        await streamClusterInForeground(cluster, orchestrator, clusterId);
       }
 
-      // Daemon mode: cluster runs in background, stay alive via orchestrator's setInterval
-      // Add cleanup handlers for daemon mode to ensure container cleanup on process exit
-      // CRITICAL: Without this, containers become orphaned when daemon process dies
-      if (process.env.ZEROSHOT_DAEMON) {
-        const cleanup = async (signal) => {
-          console.log(`\n[DAEMON] Received ${signal}, cleaning up cluster ${clusterId}...`);
-          try {
-            await orchestrator.stop(clusterId);
-            console.log(`[DAEMON] Cluster ${clusterId} stopped.`);
-          } catch (e) {
-            console.error(`[DAEMON] Cleanup error: ${e.message}`);
-          }
-          process.exit(0);
-        };
-        process.on('SIGTERM', () => cleanup('SIGTERM'));
-        process.on('SIGINT', () => cleanup('SIGINT'));
-      }
+      setupDaemonCleanup(orchestrator, clusterId);
     } catch (error) {
       console.error('Error:', error.message);
       process.exit(1);
