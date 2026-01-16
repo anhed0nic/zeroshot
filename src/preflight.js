@@ -458,6 +458,150 @@ function validateGitRequirement() {
 }
 
 /**
+ * Validate regulatory compliance
+ * @param {Object} options - Compliance options
+ * @returns {ValidationResult}
+ */
+function validateCompliance(options) {
+  const errors = [];
+  const warnings = [];
+
+  try {
+    const ComplianceEngine = require('./compliance');
+    const settings = loadSettings();
+
+    // Use settings for compliance configuration if not overridden
+    const complianceConfig = options.compliance || settings.compliance || {};
+    const enabledModules = options.enabledModules || settings.complianceModules || ['cafe', 'hipaa', 'osha', 'gdpr', 'attorneyClientPrivilege', 'usSanctions'];
+
+    const complianceEngine = new ComplianceEngine({
+      ...complianceConfig,
+      enabledModules
+    });
+
+    // Check current working directory and settings for compliance
+    const cwd = options.cwd || process.cwd();
+    const settings = loadSettings();
+
+    // Analyze repository content for compliance issues
+    const repoAnalysis = analyzeRepositoryCompliance(cwd, complianceEngine);
+
+    if (!repoAnalysis.compliant) {
+      for (const violation of repoAnalysis.violations) {
+        if (violation.severity === 'CRITICAL') {
+          errors.push(
+            formatError(
+              `Compliance Violation: ${violation.type}`,
+              violation.message,
+              ['Review and address compliance requirements', 'Consult legal counsel if needed']
+            )
+          );
+        } else {
+          warnings.push(`⚠️  Compliance Warning: ${violation.message}`);
+        }
+      }
+    }
+
+    // Check settings for compliance
+    const settingsAnalysis = analyzeSettingsCompliance(settings, complianceEngine);
+    if (!settingsAnalysis.compliant) {
+      warnings.push(...settingsAnalysis.warnings);
+    }
+
+  } catch (error) {
+    warnings.push(`⚠️  Compliance check failed: ${error.message}`);
+  }
+
+  return { errors, warnings };
+}
+
+/**
+ * Analyze repository content for compliance
+ * @param {string} repoPath - Repository path
+ * @param {ComplianceEngine} complianceEngine - Compliance engine
+ * @returns {Object} Analysis result
+ */
+function analyzeRepositoryCompliance(repoPath, complianceEngine) {
+  const result = {
+    compliant: true,
+    violations: []
+  };
+
+  try {
+    // Check common files for compliance issues
+    const filesToCheck = [
+      'README.md',
+      'package.json',
+      'LICENSE',
+      'CONTRIBUTING.md',
+      'SECURITY.md'
+    ];
+
+    for (const file of filesToCheck) {
+      const filePath = path.join(repoPath, file);
+      if (fs.existsSync(filePath)) {
+        const content = fs.readFileSync(filePath, 'utf8');
+        const complianceResult = complianceEngine.checkCompliance(content, {
+          fileType: file,
+          location: 'repository'
+        });
+
+        if (!complianceResult.overallCompliant) {
+          result.compliant = false;
+          for (const [moduleName, moduleResult] of Object.entries(complianceResult.moduleResults)) {
+            result.violations.push(...moduleResult.violations.map(v => ({
+              ...v,
+              module: moduleName,
+              file: file
+            })));
+          }
+        }
+      }
+    }
+  } catch (error) {
+    result.violations.push({
+      type: 'ANALYSIS_ERROR',
+      message: `Repository compliance analysis failed: ${error.message}`,
+      severity: 'MEDIUM'
+    });
+  }
+
+  return result;
+}
+
+/**
+ * Analyze settings for compliance
+ * @param {Object} settings - Application settings
+ * @param {ComplianceEngine} complianceEngine - Compliance engine
+ * @returns {Object} Analysis result
+ */
+function analyzeSettingsCompliance(settings, complianceEngine) {
+  const result = {
+    compliant: true,
+    warnings: []
+  };
+
+  try {
+    // Check settings content for compliance
+    const settingsContent = JSON.stringify(settings, null, 2);
+    const complianceResult = complianceEngine.checkCompliance(settingsContent, {
+      fileType: 'settings',
+      location: 'configuration'
+    });
+
+    if (!complianceResult.overallCompliant) {
+      for (const recommendation of complianceResult.summary.recommendations) {
+        result.warnings.push(`⚠️  Settings Compliance: ${recommendation}`);
+      }
+    }
+  } catch (error) {
+    result.warnings.push(`⚠️  Settings compliance check failed: ${error.message}`);
+  }
+
+  return result;
+}
+
+/**
  * Run all preflight checks
  * @param {Object} options - Preflight options
  * @param {boolean} options.requireGh - Whether gh CLI is required (true if using issue number)
@@ -582,6 +726,13 @@ function runPreflight(options = {}) {
   // 7. Check git repo (if required for worktree isolation)
   if (options.requireGit) {
     errors.push(...validateGitRequirement());
+  }
+
+  // 8. Check regulatory compliance
+  if (options.checkCompliance) {
+    const complianceResult = validateCompliance(options);
+    errors.push(...complianceResult.errors);
+    warnings.push(...complianceResult.warnings);
   }
 
   return {

@@ -11,6 +11,7 @@
  * Supports:
  * - Linux: /proc filesystem + ss
  * - macOS: ps + lsof
+ * - Windows: PowerShell + netstat
  */
 
 const { execSync } = require('./lib/safe-exec'); // Enforces timeouts
@@ -56,8 +57,14 @@ function getChildPids(pid) {
   const children = [];
 
   try {
-    const childPids =
-      PLATFORM === 'darwin' ? collectDarwinChildPids(pid) : collectLinuxChildPids(pid);
+    let childPids;
+    if (PLATFORM === 'darwin') {
+      childPids = collectDarwinChildPids(pid);
+    } else if (PLATFORM === 'win32') {
+      childPids = collectWin32ChildPids(pid);
+    } else {
+      childPids = collectLinuxChildPids(pid);
+    }
     children.push(...childPids);
 
     // Recursively get grandchildren
@@ -78,6 +85,23 @@ function collectDarwinChildPids(pid) {
   });
 
   return output.trim().split('\n').filter(Boolean).map(Number);
+}
+
+function collectWin32ChildPids(pid) {
+  try {
+    // Use PowerShell to get child processes
+    const output = execSync(
+      `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq ${escapeShell(String(pid))} } | Select-Object -ExpandProperty ProcessId"`,
+      {
+        encoding: 'utf8',
+        timeout: 2000,
+      }
+    );
+
+    return output.trim().split('\n').filter(Boolean).map(Number);
+  } catch {
+    return [];
+  }
 }
 
 function collectLinuxChildPids(pid) {
@@ -180,6 +204,48 @@ function getProcessMetricsDarwin(pid) {
       cpuPercent, // macOS ps gives us percent directly
       memoryKB: rssKB,
       threads: 1, // ps doesn't give thread count easily
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get metrics for a single process (Windows)
+ * @param {number} pid - Process ID
+ * @returns {Object|null} Metrics or null if process doesn't exist
+ */
+function getProcessMetricsWin32(pid) {
+  try {
+    // Use PowerShell to get process info
+    const output = execSync(
+      `powershell -NoProfile -Command "Get-Process -Id ${escapeShell(String(pid))} | Select-Object CPU,WorkingSet,Threads | Format-List"`,
+      {
+        encoding: 'utf8',
+        timeout: 2000,
+      }
+    );
+
+    if (!output.trim()) {
+      return null;
+    }
+
+    // Parse the output
+    const cpuMatch = output.match(/CPU\s*:\s*([\d.]+)/);
+    const memoryMatch = output.match(/WorkingSet\s*:\s*(\d+)/);
+    const threadsMatch = output.match(/Threads\s*:\s*(\d+)/);
+
+    const cpuPercent = cpuMatch ? parseFloat(cpuMatch[1]) : 0;
+    const memoryBytes = memoryMatch ? parseInt(memoryMatch[1], 10) : 0;
+    const threads = threadsMatch ? parseInt(threadsMatch[1], 10) : 1;
+
+    return {
+      pid,
+      exists: true,
+      state: 'R', // Windows doesn't expose process state easily
+      cpuPercent,
+      memoryKB: Math.round(memoryBytes / 1024),
+      threads,
     };
   } catch {
     return null;
@@ -308,6 +374,51 @@ function getNetworkStateDarwin(pid) {
 }
 
 /**
+ * Get network state for a process (Windows)
+ * Note: Windows doesn't expose per-socket byte counts easily without admin privileges
+ * We return basic connection counts
+ * @param {number} pid - Process ID
+ * @returns {Object} Network state
+ */
+function getNetworkStateWin32(pid) {
+  const result = {
+    established: 0,
+    hasActivity: false,
+    sendQueueBytes: 0,
+    recvQueueBytes: 0,
+    bytesSent: 0, // Not available on Windows without admin/detailed APIs
+    bytesReceived: 0, // Not available on Windows without admin/detailed APIs
+  };
+
+  try {
+    // Use netstat to find connections for this PID
+    const output = execSync(`netstat -ano 2>nul | findstr ${escapeShell(String(pid))}`, {
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+
+    if (!output.trim()) {
+      return result;
+    }
+
+    const lines = output.trim().split('\n');
+
+    for (const line of lines) {
+      const parts = line.trim().split(/\s+/);
+      // Look for ESTABLISHED connections
+      if (parts[3] === 'ESTABLISHED') {
+        result.established++;
+        result.hasActivity = true;
+      }
+    }
+  } catch {
+    // Ignore errors
+  }
+
+  return result;
+}
+
+/**
  * Get real-time metrics for a process and its children
  * @param {number} pid - Process ID
  * @param {Object} [options] - Options
@@ -319,6 +430,8 @@ function getProcessMetrics(pid, options = {}) {
 
   if (PLATFORM === 'darwin') {
     return getProcessMetricsDarwinAggregated(pid);
+  } else if (PLATFORM === 'win32') {
+    return getProcessMetricsWin32Aggregated(pid);
   }
 
   return getProcessMetricsLinuxAggregated(pid, samplePeriodMs);
@@ -513,6 +626,77 @@ function getProcessMetricsDarwinAggregated(pid) {
 }
 
 /**
+ * Get aggregated metrics for process tree (Windows)
+ * @param {number} pid - Root process ID
+ * @returns {Promise<ProcessMetrics>}
+ */
+function getProcessMetricsWin32Aggregated(pid) {
+  const allPids = [pid, ...getChildPids(pid)];
+  let totalCpuPercent = 0;
+  let totalMemoryKB = 0;
+  let totalThreads = 0;
+  let rootState = 'R';
+  let existsCount = 0;
+
+  for (const p of allPids) {
+    const m = getProcessMetricsWin32(p);
+    if (m) {
+      existsCount++;
+      totalCpuPercent += m.cpuPercent;
+      totalMemoryKB += m.memoryKB;
+      totalThreads += m.threads;
+
+      if (p === pid) {
+        rootState = m.state;
+      }
+    }
+  }
+
+  if (existsCount === 0) {
+    return {
+      pid,
+      exists: false,
+      cpuPercent: 0,
+      memoryMB: 0,
+      state: 'X',
+      threads: 0,
+      network: { established: 0, hasActivity: false, sendQueueBytes: 0, recvQueueBytes: 0 },
+      childCount: 0,
+      timestamp: Date.now(),
+    };
+  }
+
+  // Get network state
+  let network = {
+    established: 0,
+    hasActivity: false,
+    sendQueueBytes: 0,
+    recvQueueBytes: 0,
+    bytesSent: 0,
+    bytesReceived: 0,
+  };
+  for (const p of allPids) {
+    const netState = getNetworkStateWin32(p);
+    network.established += netState.established;
+    network.bytesSent += netState.bytesSent;
+    network.bytesReceived += netState.bytesReceived;
+    if (netState.hasActivity) network.hasActivity = true;
+  }
+
+  return {
+    pid,
+    exists: true,
+    cpuPercent: parseFloat(totalCpuPercent.toFixed(1)),
+    memoryMB: parseFloat((totalMemoryKB / 1024).toFixed(1)),
+    state: rootState,
+    threads: totalThreads,
+    network,
+    childCount: existsCount - 1,
+    timestamp: Date.now(),
+  };
+}
+
+/**
  * Format metrics for display
  * @param {ProcessMetrics} metrics
  * @returns {string} Formatted string
@@ -575,7 +759,7 @@ function getStateIcon(state) {
  * @returns {boolean}
  */
 function isPlatformSupported() {
-  return PLATFORM === 'linux' || PLATFORM === 'darwin';
+  return PLATFORM === 'linux' || PLATFORM === 'darwin' || PLATFORM === 'win32';
 }
 
 /**
@@ -603,6 +787,8 @@ module.exports = {
   // Export internal functions for testing
   getProcessMetricsLinux,
   getProcessMetricsDarwin,
+  getProcessMetricsWin32,
   getNetworkStateLinux,
   getNetworkStateDarwin,
+  getNetworkStateWin32,
 };

@@ -271,6 +271,9 @@ function runClusterPreflight({ input, options, providerOverride, settings, force
     requireGh: issueProvider === 'github', // gh CLI required for GitHub
     requireDocker: options.docker,
     requireGit: options.worktree,
+    checkCompliance: options.compliance || settings.complianceEnabled,
+    compliance: settings.compliance,
+    enabledModules: settings.complianceModules,
     quiet: process.env.ZEROSHOT_DAEMON === '1',
     provider: providerOverride,
     issueProvider, // Pass detected issue provider for tool checking
@@ -2374,6 +2377,7 @@ program
     'Override all agents to use a provider (claude, codex, gemini, opencode)'
   )
   .option('--model <model>', 'Override all agent models (provider-specific model id)')
+  .option('--compliance', 'Enable regulatory compliance checks')
   .option('-G, --github', 'Force GitHub as issue source')
   .option('-L, --gitlab', 'Force GitLab as issue source')
   .option('-J, --jira', 'Force Jira as issue source')

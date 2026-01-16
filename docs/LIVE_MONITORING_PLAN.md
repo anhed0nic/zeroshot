@@ -199,6 +199,7 @@ const table = blessed.listtable({
 |----------|---------|---------|-----|---------------|
 | Linux | `/proc/stat` | `ss -tunp` | `/proc/io` | Full |
 | macOS | `ps -o %cpu,rss` | `lsof -i` | N/A (requires sudo) | Full (no I/O) |
+| Windows | `Get-Process` | `netstat` | N/A | Full (no I/O) |
 | Windows WSL | `/proc/stat` | `ss -tunp` | `/proc/io` | Full |
 
 ```javascript
@@ -206,6 +207,8 @@ const table = blessed.listtable({
 function getProcessMetrics(pid) {
   if (process.platform === 'darwin') {
     return getMetricsDarwin(pid);  // ps + lsof
+  } else if (process.platform === 'win32') {
+    return getMetricsWin32(pid);   // PowerShell + netstat
   }
   return getMetricsLinux(pid);     // /proc + ss
 }
@@ -230,4 +233,4 @@ function getProcessMetrics(pid) {
 - [ ] `zeroshot watch` shows all agents with metrics
 - [ ] Metrics update every 1 second
 - [ ] No noticeable CPU overhead (<1% additional)
-- [ ] Works on Linux and degrades gracefully on macOS
+- [ ] Works on Linux, macOS, and Windows
